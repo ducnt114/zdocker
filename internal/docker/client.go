@@ -19,6 +19,10 @@ type Client interface {
 	// only running ones (like `docker ps` without -a).
 	ListContainers(ctx context.Context, all bool) ([]Container, error)
 
+	// ListImages returns one row per image tag, with the number of
+	// containers using each image.
+	ListImages(ctx context.Context) ([]Image, error)
+
 	// Events streams container and image events until ctx is cancelled or
 	// the stream breaks. Callers re-list on events (there is no watch with
 	// resource versions as in Kubernetes).

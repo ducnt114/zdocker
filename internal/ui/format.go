@@ -4,6 +4,7 @@ package ui
 
 import (
 	"fmt"
+	"strings"
 	"time"
 )
 
@@ -46,4 +47,21 @@ func trimZero(a int, unitA string, b int, unitB string) string {
 		return fmt.Sprintf("%d%s", a, unitA)
 	}
 	return fmt.Sprintf("%d%s%d%s", a, unitA, b, unitB)
+}
+
+// formatSize renders a byte count the way the docker CLI does: decimal
+// units and about three significant digits ("187MB", "1.23GB", "5kB").
+func formatSize(n int64) string {
+	units := []string{"B", "kB", "MB", "GB", "TB", "PB"}
+	f := float64(n)
+	i := 0
+	for f >= 1000 && i < len(units)-1 {
+		f /= 1000
+		i++
+	}
+	s := fmt.Sprintf("%.3g", f)
+	if strings.Contains(s, "e") { // %g switched to exponent notation (≥ 1000)
+		s = fmt.Sprintf("%.0f", f)
+	}
+	return s + units[i]
 }

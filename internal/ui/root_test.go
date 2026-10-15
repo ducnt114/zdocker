@@ -18,8 +18,17 @@ type fakeClient struct {
 	mu         sync.Mutex
 	pingErr    error
 	containers []docker.Container
-	listCalls  []bool // the `all` argument of each ListContainers call
+	listCalls  []bool            // the `all` argument of each ListContainers call
 	streams    []context.Context // one per Events call
+	images     []docker.Image
+	imageCalls int
+}
+
+func (f *fakeClient) ListImages(context.Context) ([]docker.Image, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.imageCalls++
+	return append([]docker.Image(nil), f.images...), nil
 }
 
 // Events returns a stream that stays open (and quiet) until ctx is
@@ -55,7 +64,11 @@ func (f *fakeClient) ListContainers(_ context.Context, all bool) ([]docker.Conta
 
 func newFake() *fakeClient {
 	now := time.Now()
-	return &fakeClient{containers: []docker.Container{
+	return &fakeClient{images: []docker.Image{
+		{ID: "sha256:dead00000000beef", Repository: "<none>", Tag: "<none>", Size: 5_000, Created: now.Add(-48 * time.Hour)},
+		{ID: "sha256:aaaa00000000aaaa", Repository: "nginx", Tag: "1.27", Size: 187_000_000, Created: now.Add(-24 * time.Hour), Containers: 1},
+		{ID: "sha256:aaaa00000000aaaa", Repository: "nginx", Tag: "latest", Size: 187_000_000, Created: now.Add(-24 * time.Hour), Containers: 1},
+	}, containers: []docker.Container{
 		{ID: "a1", Name: "api", Image: "api:dev", State: "exited", Status: "Exited (1) 3 minutes ago", Created: now.Add(-time.Hour)},
 		{ID: "w1", Name: "web", Image: "nginx:1.27", State: "running", Status: "Up 2 hours", Ports: "0.0.0.0:8080->80/tcp", Created: now.Add(-2 * time.Hour)},
 	}}
@@ -255,6 +268,64 @@ func TestBackoffGrows(t *testing.T) {
 	for i := range want {
 		if got[i] != want[i]*time.Second {
 			t.Fatalf("backoffs = %v", got)
+		}
+	}
+}
+
+func TestImagesView(t *testing.T) {
+	f := newFake()
+	m := startModel(t, f)
+	m = typeCommand(t, m, "images")
+	if m.active != viewImages {
+		t.Fatalf("active = %v", m.active)
+	}
+	rows := m.images.table.rows
+	if len(rows) != 3 {
+		t.Fatalf("rows = %v", rows)
+	}
+	// REPOSITORY TAG ID SIZE INUSE AGE
+	if rows[1][0] != "nginx" || rows[1][2] != "aaaa00000000" || rows[1][3] != "187MB" || rows[1][4] != "1" {
+		t.Errorf("nginx row = %v", rows[1])
+	}
+	if rows[0][0] != "<none>" || rows[0][4] != "-" {
+		t.Errorf("dangling row = %v", rows[0])
+	}
+	// The total counts the nginx image once, not once per tag.
+	if !strings.Contains(m.images.View(), "2 images, 187MB") {
+		t.Fatalf("title: %s", m.images.View())
+	}
+}
+
+func TestContainerCreateReloadsImages(t *testing.T) {
+	f := newFake()
+	m := startModel(t, f)
+	gen := m.events.gen
+
+	before := f.imageCalls
+	m = send(t, m, dockerEventsMsg{gen: gen, events: []docker.Event{{Kind: "container", Action: "start"}}})
+	m = send(t, m, debounceMsg{gen: gen})
+	if f.imageCalls != before {
+		t.Fatal("a container start doesn't change image usage: no image re-list")
+	}
+	m = send(t, m, dockerEventsMsg{gen: gen, events: []docker.Event{{Kind: "container", Action: "create"}}})
+	m = send(t, m, debounceMsg{gen: gen})
+	if f.imageCalls != before+1 {
+		t.Fatal("a container create changes the IN USE count: images should be re-listed")
+	}
+}
+
+func TestFormatSize(t *testing.T) {
+	tests := map[int64]string{
+		0:             "0B",
+		999:           "999B",
+		5_000:         "5kB",
+		187_000_000:   "187MB",
+		1_234_000_000: "1.23GB",
+		999_900_000:   "1000MB", // %.3g would print 1e+03: avoided
+	}
+	for in, want := range tests {
+		if got := formatSize(in); got != want {
+			t.Errorf("formatSize(%d) = %q, want %q", in, got, want)
 		}
 	}
 }

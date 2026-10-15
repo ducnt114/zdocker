@@ -35,6 +35,7 @@ func (h helpKeys) FullHelp() [][]key.Binding {
 		{g.Command, g.Help, g.Quit},
 		{
 			key.NewBinding(key.WithKeys(":containers"), key.WithHelp(":containers", "containers (:ps)")),
+			key.NewBinding(key.WithKeys(":images"), key.WithHelp(":images", "images (:img)")),
 			key.NewBinding(key.WithKeys(":q"), key.WithHelp(":q", "quit")),
 		},
 	}

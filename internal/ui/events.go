@@ -132,6 +132,11 @@ func (w eventsWatcher) Update(msg tea.Msg) (eventsWatcher, tea.Cmd) {
 			switch ev.Kind {
 			case "container":
 				w.dirtyContainers = true
+				// Creating or removing a container changes the images'
+				// "in use" count.
+				if ev.Action == "create" || ev.Action == "destroy" {
+					w.dirtyImages = true
+				}
 			case "image":
 				w.dirtyImages = true
 			}

@@ -23,6 +23,7 @@ type viewID int
 
 const (
 	viewContainers viewID = iota
+	viewImages
 )
 
 // connectedMsg reports the result of the initial Ping.
@@ -40,6 +41,7 @@ type Model struct {
 
 	active     viewID
 	containers containersView
+	images     imagesView
 
 	commandMode bool
 	command     textinput.Model
@@ -56,13 +58,14 @@ type Model struct {
 func New(c docker.Client) Model {
 	ti := textinput.New()
 	ti.Prompt = ":"
-	ti.Placeholder = "containers | quit"
+	ti.Placeholder = "containers | images | quit"
 
 	return Model{
 		client:     c,
 		events:     eventsWatcher{client: c},
 		active:     viewContainers,
 		containers: newContainersView(c),
+		images:     newImagesView(c),
 		command:    ti,
 		help:       help.New(),
 		status:     "connecting…",
@@ -107,7 +110,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.server = msg.info
 		m.status, m.statusIsErr = fmt.Sprintf("connected to %s (API %s)", msg.info.Host, msg.info.APIVersion), false
 		// List once, then follow events and re-list what changes.
-		return m, tea.Batch(m.containers.load(), m.events.start())
+		return m, tea.Batch(m.containers.load(), m.images.load(), m.events.start())
 
 	case eventsStartedMsg, dockerEventsMsg, eventsEndedMsg, debounceMsg, reconnectMsg:
 		var cmd tea.Cmd
@@ -118,6 +121,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		var cmds []tea.Cmd
 		if msg.containers {
 			cmds = append(cmds, m.containers.load())
+		}
+		if msg.images {
+			cmds = append(cmds, m.images.load())
 		}
 		return m, tea.Batch(cmds...)
 
@@ -130,9 +136,18 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.containers, cmd = m.containers.Update(msg)
 		return m, cmd
 
+	case imagesLoadedMsg:
+		if msg.err == nil {
+			m.events.healthy()
+		}
+		var cmd tea.Cmd
+		m.images, cmd = m.images.Update(msg)
+		return m, cmd
+
 	case ageTickMsg:
 		var cmd tea.Cmd
 		m.containers, cmd = m.containers.Update(msg)
+		m.images, _ = m.images.Update(msg)
 		return m, cmd
 	}
 	return m.updateActive(msg)
@@ -189,6 +204,9 @@ func (m Model) runCommand(input string) (tea.Model, tea.Cmd) {
 	case "containers", "container", "ps", "co":
 		m.setActive(viewContainers)
 		return m, nil
+	case "images", "image", "img", "i":
+		m.setActive(viewImages)
+		return m, nil
 	case "q", "quit":
 		return m, tea.Quit
 	}
@@ -205,6 +223,8 @@ func (m Model) updateActive(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch m.active {
 	case viewContainers:
 		m.containers, cmd = m.containers.Update(msg)
+	case viewImages:
+		m.images, cmd = m.images.Update(msg)
 	}
 	return m, cmd
 }
@@ -213,6 +233,8 @@ func (m Model) activeCapturingInput() bool {
 	switch m.active {
 	case viewContainers:
 		return m.containers.capturingInput()
+	case viewImages:
+		return m.images.capturingInput()
 	}
 	return false
 }
@@ -221,6 +243,8 @@ func (m Model) activeKeys() helpKeys {
 	switch m.active {
 	case viewContainers:
 		return helpKeys{view: m.containers.keys()}
+	case viewImages:
+		return helpKeys{view: m.images.keys()}
 	}
 	return helpKeys{}
 }
@@ -233,6 +257,7 @@ func (m *Model) layout() {
 	chrome := 2 + lipgloss.Height(m.help.View(m.activeKeys())) // header + status + help
 	m.bodyHeight = max(m.height-chrome, 1)
 	m.containers.SetSize(m.width, m.bodyHeight)
+	m.images.SetSize(m.width, m.bodyHeight)
 }
 
 func (m Model) View() string {
@@ -243,6 +268,8 @@ func (m Model) View() string {
 	switch m.active {
 	case viewContainers:
 		body = m.containers.View()
+	case viewImages:
+		body = m.images.View()
 	}
 	// Pin the body height so the status and help bars stay at the bottom.
 	body = lipgloss.NewStyle().Height(m.bodyHeight).MaxHeight(m.bodyHeight).Render(body)

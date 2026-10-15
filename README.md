@@ -1,7 +1,7 @@
 # zdocker
 
 A small, k9s-like terminal UI for your **local Docker** containers and
-images, built with [Bubble Tea](https://github.com/charmbracelet/bubbletea)
+images (with an IN USE count per image), built with [Bubble Tea](https://github.com/charmbracelet/bubbletea)
 and the official [Moby client](https://pkg.go.dev/github.com/moby/moby/client).
 
 zdocker is a learning project and a sibling of
@@ -48,7 +48,7 @@ header shows `● live` or `○ reconnecting`.
 | `↑↓ jk` | move |
 | `a` | toggle all / running containers |
 | `r` | refresh |
-| `:` | command (`:containers`, `:q`) |
+| `:` | command (`:containers`/`:ps`, `:images`/`:img`, `:q`) |
 | `?` | help |
 | `q` | quit |
 

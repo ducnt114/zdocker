@@ -19,31 +19,48 @@ import (
 
 	"github.com/moby/moby/api/types/container"
 	"github.com/moby/moby/api/types/events"
+	"github.com/moby/moby/api/types/image"
 )
 
 var versionPrefix = regexp.MustCompile(`^/v[0-9]+\.[0-9]+`)
 
+// Image IDs shared by the sample images and containers.
+const (
+	nginxID   = "sha256:6e5f0b6bd4f2f1d7a3b0e3c09c8f8a5d0b3c6d9e1f2a3b4c5d6e7f8091a2b3c4"
+	apiID     = "sha256:a1b2c3d4e5f60718293a4b5c6d7e8f901a2b3c4d5e6f708192a3b4c5d6e7f809"
+	workerID  = "sha256:b2c3d4e5f60718293a4b5c6d7e8f901a2b3c4d5e6f708192a3b4c5d6e7f8091a"
+	busyboxID = "sha256:c3d4e5f60718293a4b5c6d7e8f901a2b3c4d5e6f708192a3b4c5d6e7f8091a2b"
+	oldID     = "sha256:d4e5f60718293a4b5c6d7e8f901a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c"
+)
+
 type daemon struct {
 	mu          sync.Mutex
 	containers  []container.Summary
+	images      []image.Summary
 	subscribers map[chan events.Message]bool // /events streams
 }
 
 func newDaemon() *daemon {
 	now := time.Now()
-	return &daemon{subscribers: map[chan events.Message]bool{}, containers: []container.Summary{
-		{ID: "c0ffee000001aaaaaaaaaaaaaaaaaaaa", Names: []string{"/web"}, Image: "nginx:1.27",
+	return &daemon{subscribers: map[chan events.Message]bool{}, images: []image.Summary{
+		{ID: nginxID, RepoTags: []string{"nginx:1.27", "nginx:latest"}, Size: 192_400_000, Created: now.Add(-21 * 24 * time.Hour).Unix()},
+		{ID: apiID, RepoTags: []string{"shop/api:dev"}, Size: 48_200_000, Created: now.Add(-3 * time.Hour).Unix()},
+		{ID: workerID, RepoTags: []string{"shop/worker:dev"}, Size: 51_700_000, Created: now.Add(-3 * time.Hour).Unix()},
+		{ID: busyboxID, RepoTags: []string{"busybox:1.36"}, Size: 4_260_000, Created: now.Add(-400 * 24 * time.Hour).Unix()},
+		{ID: oldID, RepoTags: nil, Size: 48_100_000, Created: now.Add(-9 * 24 * time.Hour).Unix()}, // dangling
+	}, containers: []container.Summary{
+		{ID: "c0ffee000001aaaaaaaaaaaaaaaaaaaa", Names: []string{"/web"}, ImageID: nginxID, Image: "nginx:1.27",
 			State: container.StateRunning, Status: "Up 2 hours (healthy)", Created: now.Add(-2 * time.Hour).Unix(),
 			Ports:  []container.PortSummary{{PrivatePort: 80, PublicPort: 8080, Type: "tcp"}},
 			Labels: map[string]string{"com.docker.compose.project": "shop"}},
-		{ID: "c0ffee000002aaaaaaaaaaaaaaaaaaaa", Names: []string{"/api"}, Image: "shop/api:dev",
+		{ID: "c0ffee000002aaaaaaaaaaaaaaaaaaaa", Names: []string{"/api"}, ImageID: apiID, Image: "shop/api:dev",
 			State: container.StateRunning, Status: "Up 2 hours", Created: now.Add(-2 * time.Hour).Unix(),
 			Labels: map[string]string{"com.docker.compose.project": "shop"}},
-		{ID: "c0ffee000003aaaaaaaaaaaaaaaaaaaa", Names: []string{"/worker"}, Image: "shop/worker:dev",
+		{ID: "c0ffee000003aaaaaaaaaaaaaaaaaaaa", Names: []string{"/worker"}, ImageID: workerID, Image: "shop/worker:dev",
 			State: container.StateRestarting, Status: "Restarting (1) 4 seconds ago", Created: now.Add(-30 * time.Minute).Unix()},
-		{ID: "c0ffee000004aaaaaaaaaaaaaaaaaaaa", Names: []string{"/migrate"}, Image: "shop/api:dev",
+		{ID: "c0ffee000004aaaaaaaaaaaaaaaaaaaa", Names: []string{"/migrate"}, ImageID: apiID, Image: "shop/api:dev",
 			State: container.StateExited, Status: "Exited (0) 25 minutes ago", Created: now.Add(-26 * time.Minute).Unix()},
-		{ID: "c0ffee000005aaaaaaaaaaaaaaaaaaaa", Names: []string{"/flaky"}, Image: "busybox:1.36",
+		{ID: "c0ffee000005aaaaaaaaaaaaaaaaaaaa", Names: []string{"/flaky"}, ImageID: busyboxID, Image: "busybox:1.36",
 			State: container.StateExited, Status: "Exited (137) 3 minutes ago", Created: now.Add(-time.Hour).Unix()},
 	}}
 }
@@ -61,6 +78,10 @@ func (d *daemon) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		d.listContainers(w, r)
 	case "GET /events":
 		d.streamEvents(w, r)
+	case "GET /images/json":
+		d.mu.Lock()
+		writeJSON(w, d.images)
+		d.mu.Unlock()
 	default:
 		http.Error(w, `{"message":"fakedaemon: not implemented"}`, http.StatusNotFound)
 	}

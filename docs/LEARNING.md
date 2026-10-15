@@ -9,6 +9,7 @@ zdocker là "anh em" của [kboba](https://github.com/ducnt114/kboba): cùng ki�
 1. [Bức tranh tổng thể](#1-bức-tranh-tổng-thể)
 2. [Phase (a): Skeleton, kết nối, bảng containers](#2-phase-a-skeleton-kết-nối-bảng-containers)
 3. [Phase (b): Realtime bằng Docker events](#3-phase-b-realtime-bằng-docker-events)
+4. [Phase (c): Images](#4-phase-c-images)
 
 ---
 
@@ -149,4 +150,46 @@ reconnectMsg     → start() lại + reloadMsg{tất cả}  (event bị lỡ khi
 | Event bị lỡ khi mất kết nối | Reconnect luôn kèm một lần list lại toàn bộ |
 | Reset backoff khi stream "start" → vòng lặp 1s khi daemon chết | Chỉ reset khi một lệnh list thật sự thành công |
 | Test harness bỏ Cmd chờ channel sau 50ms (bài học từ kboba 3.1) | Test đưa `dockerEventsMsg`/`debounceMsg`/`eventsEndedMsg` vào trực tiếp; luồng stream thật được test ở `internal/docker` |
+
+## 4. Phase (c): Images
+
+### Mục tiêu
+`:images` (`:img`, `:i`) hiện bảng REPOSITORY, TAG, IMAGE ID, SIZE, IN USE, AGE giống `docker images`, cộng tổng số image và dung lượng trên tiêu đề. Image không container nào dùng (ứng viên cho `docker image prune`) có màu mờ. Bảng cũng cập nhật theo events.
+
+### Học được gì
+- **Một image, nhiều tag:** `ImageList` trả mỗi image *một lần* với `RepoTags []string`; CLI hiện mỗi tag một dòng. Dòng không còn duy nhất theo ID → khoá dòng là `ID + repo:tag`. Tổng dung lượng phải đếm mỗi ID một lần.
+- **Tách `repo:tag` đúng cách:** dấu `:` cuối cùng *không* luôn là tag — `localhost:5000/app` có cổng registry mà không có tag. Quy tắc: lấy `:` cuối; nếu phần sau nó chứa `/` thì đó là cổng, không phải tag.
+- **Ghép dữ liệu phía client:** trường `Containers` của image summary mặc định là `-1` (daemon chỉ tính khi được yêu cầu dữ liệu disk-usage, tốn kém). Một `ContainerList(all)` rất rẻ → tự đếm `ImageID` → `IN USE`.
+- **Event nào ảnh hưởng view nào:** container `create`/`destroy` làm thay đổi `IN USE` của image, nên watcher đánh dấu cả images là dirty cho hai action này (start/stop thì không).
+- **Định dạng dung lượng kiểu docker CLI:** đơn vị thập phân (kB = 1000), ~3 chữ số có nghĩa.
+
+### Thể hiện trong code
+
+**k8s-less list** (`internal/docker/images.go`):
+- `ListImages`: `ImageList` + `ContainerList(All: true)` → `inUse[ImageID]++` → mỗi `RepoTags` một `Image`; image dangling (không tag) → `<none>:<none>`. Sắp xếp theo repository rồi tag.
+- `splitRef`: `LastIndex(":")`, bỏ qua nếu phần sau có `/`.
+- `Image.Ref()` (`repo:tag`, hoặc short ID khi không có tag) — dùng cho các thao tác ở phase sau (`rmi`).
+
+**UI** (`internal/ui/images.go` → `imagesView`): cùng khuôn với `containersView` (load có `gen`, giữ lựa chọn theo khoá *trước* khi thay danh sách — bài học của phase (a)), khác ở khoá dòng (`imageRowKey`) và màu (không ai dùng → `finished`/xám).
+- `formatSize` (`format.go`): chia 1000 cho tới khi < 1000, in `%.3g`. Bẫy: `%.3g` của 999.95 cho ra `1e+03` → phát hiện chữ `e` và in số nguyên.
+
+**Root**: `viewImages`; `:images`/`:img`/`:i`; load images lúc kết nối cùng containers; `reloadMsg.images` → `images.load()`; `imagesLoadedMsg` thành công cũng gọi `events.healthy()`.
+
+**Events** (`events.go`): container `create`/`destroy` → `dirtyImages = true`.
+
+**Fake daemon chạy được**: thêm `/images/json` với 5 image (nginx 2 tag, một image dangling) và gán `ImageID` cho các container mẫu.
+
+### Test liên quan
+- `internal/docker/images_test.go`: `TestListImages` (một dòng mỗi tag, dangling `<none>`, registry có cổng, IN USE từ danh sách container `all=1`, `Ref`/`ShortID`), `TestSplitRef`.
+- `internal/ui/root_test.go`: `TestImagesView` (cột, `-` cho không dùng, tổng `2 images, 187MB` không đếm trùng tag), `TestContainerCreateReloadsImages` (`start` không list images, `create` thì có), `TestFormatSize` (gồm ca `1000MB`).
+- Thủ công: `:img` trên fake daemon — IN USE khớp số container, dangling màu mờ.
+
+### Bẫy
+| Bẫy | Cách xử lý |
+|---|---|
+| Khoá dòng theo image ID → trùng khi một image có nhiều tag | Khoá `ID + repo:tag` |
+| Tổng dung lượng đếm một image nhiều lần | Đếm theo ID đã thấy |
+| `localhost:5000/app` bị tách thành repo `localhost`, tag `5000/app` | Phần sau `:` cuối chứa `/` → không phải tag |
+| `Containers` của image summary là `-1` | Tự đếm từ `ContainerList(all)` |
+| `%.3g` in `1e+03` | Phát hiện và in dạng số nguyên |
 
