@@ -13,6 +13,8 @@ zdocker là "anh em" của [kboba](https://github.com/ducnt114/kboba): cùng ki�
 5. [Phase (d): Logs](#5-phase-d-logs)
 6. [Phase (e): Inspect, filter, sort](#6-phase-e-inspect-filter-sort)
 7. [Phase (f): Thao tác, xác nhận, `--read-only`](#7-phase-f-thao-tác-xác-nhận---read-only)
+8. [Phase (g): Stats](#8-phase-g-stats)
+9. [Tổng kết MVP và Phase 2](#9-tổng-kết-mvp-và-phase-2)
 
 ---
 
@@ -363,4 +365,62 @@ Cờ `--read-only` tắt toàn bộ thao tác ghi: header có nhãn `read-only`,
 | Read-only chỉ ẩn phím ở UI | `docker.ReadOnly` chặn ở client |
 | Embed interface chuyển tiếp cả method ghi mới thêm | `TestEveryMethodIsClassified` + `TestReadOnlyBlocksEveryWrite` |
 | Lỗi hiện nguyên JSON vì fake daemon trả `text/plain` | Trả lỗi với `Content-Type: application/json` như daemon thật |
+
+## 8. Phase (g): Stats
+
+### Mục tiêu
+`t` trên một container → mức dùng tài nguyên realtime, như `docker stats` cho một container: CPU %, MEM (đã dùng / giới hạn / %), NET ↓↑, BLOCK read/write, PIDS — với **sparkline** 60 mẫu gần nhất (~1 phút) cho CPU và MEM.
+
+### Học được gì
+- **Stats của Docker là số đếm luỹ kế**, không phải phần trăm: `cpu_usage.total_usage` (ns CPU container đã dùng từ lúc chạy), `system_cpu_usage` (ns CPU của cả host từ lúc boot). Phần trăm = *chênh lệch* giữa hai lần đọc. Daemon gửi sẵn lần đọc trước trong `precpu_stats`:
+
+  `CPU% = (Δ container / Δ hệ thống) × số CPU × 100` — 100% = một CPU đầy, 4 CPU có thể tới 400%.
+- **Mẫu đầu tiên không có lần đọc trước** (`precpu.system = 0`): chênh lệch so với 0 là vô nghĩa (đếm từ lúc boot) → trả 0 ("chưa biết"). Test đã bắt chỗ code nói một đằng làm một nẻo.
+- **Bộ nhớ "dùng" không bằng `usage`**: `usage` gồm page cache (có thể thu hồi). Như CLI, trừ `inactive_file` (cgroup v2) hoặc `total_inactive_file` (cgroup v1, ưu tiên nếu có).
+- **Đơn vị**: `docker stats` hiện bộ nhớ theo đơn vị nhị phân (MiB, GiB) nhưng mạng/đĩa theo thập phân (kB, MB) — giữ đúng như vậy để người quen CLI không bối rối.
+- **Một stream các object JSON**: `json.NewDecoder(body)` + `Decode` lặp lại đọc từng object khi chúng đến (không cần tách dòng).
+- **Sparkline** chỉ là ánh xạ giá trị → 8 ký tự `▁▂▃▄▅▆▇█`, theo tỷ lệ với đỉnh trong cửa sổ (có "sàn" để nhiễu nhỏ không bị phóng to thành cả cột).
+
+### Thể hiện trong code
+
+**`internal/docker/stats.go`**:
+- `ContainerStats(ctx, id)`: `api.ContainerStats(…, {Stream: true})` → goroutine `Decode` từng `container.StatsResponse` → `newStats` → channel; cùng hợp đồng channel + lỗi như logs/events.
+- `newStats` / `cpuPercent`: hàm thuần — toàn bộ phép tính ở trên, test bằng bảng ca. `cpuPercent` dùng `OnlineCPUs`, thiếu thì đếm `PercpuUsage`.
+- NET: cộng `RxBytes`/`TxBytes` của mọi interface; BLOCK: cộng `io_service_bytes_recursive` theo `op` `read`/`write` (cả hai kiểu viết hoa, tuỳ cgroup).
+
+**`internal/ui/stats.go` → `statsView`**: vòng đời giống logs (context huỷ được, `gen`, `receiveBatch`, huỷ trong `setActive` khi rời view); `history` giữ tối đa 60 mẫu (cắt slice); `View` tính đỉnh trong cửa sổ, `sparkline(values, width, floor)` (sàn: 1% CPU, 1 MiB), `formatBinary` cho bộ nhớ.
+
+**Fake daemon chạy được**: `/containers/{id}/stats?stream=true` gửi một mẫu mỗi giây với `precpu_stats` là mẫu trước, CPU/MEM dao động theo hàm sin để sparkline có hình.
+
+### Test liên quan
+- `internal/docker/stats_test.go`: `TestCPUPercent` (1 trên 4 CPU = 100%, nửa CPU, mẫu đầu = 0, không có Δ hệ thống, dự phòng bằng `PercpuUsage`), `TestMemoryNetworkBlock` (trừ cache v2 và v1 — v1 ưu tiên, cộng nhiều interface, `read`/`Read`, bỏ `total`), `TestContainerStatsStream` (stream nhiều object, `stream=true`).
+- `internal/ui/root_test.go`: `TestStatsView` (các con số và định dạng, lịch sử giới hạn 60, mẫu cũ bị bỏ, Esc huỷ stream), `TestSparkline`, `TestFormatBinary`.
+- Thủ công với fake daemon: sparkline chạy mỗi giây, mẫu CPU đầu tiên là `▁`.
+
+### Bẫy
+| Bẫy | Cách xử lý |
+|---|---|
+| Hiểu `total_usage` là phần trăm | Lấy chênh lệch với `precpu_stats` |
+| Mẫu đầu tiên ra số khổng lồ/vô nghĩa | `precpu.system == 0` → 0 |
+| MEM cao hơn thực tế (gồm page cache) | Trừ `inactive_file` / `total_inactive_file` |
+| Lẫn đơn vị nhị phân/thập phân | MiB/GiB cho bộ nhớ, kB/MB cho mạng/đĩa — như CLI |
+| Test giả định query `stream=1` | Moby gửi `stream=true` — đọc request thật trong fake daemon |
+
+## 9. Tổng kết MVP và Phase 2
+
+MVP gồm 7 phase, mỗi phase một commit: kết nối + bảng containers (a), realtime bằng events (b), images (c), logs (d), inspect + filter + sort (e), thao tác có xác nhận + `--read-only` (f), stats (g).
+
+So với kboba, zdocker cho thấy cùng một kiến trúc Bubble Tea áp vào một API rất khác: không có informer → events + list lại có debounce; có thao tác ghi → mô tả ở view, thực hiện ở root, xác nhận chỉ bằng `y`, chặn thật ở client; stream log ghép kênh → `stdcopy` + writer giữ thứ tự; stats luỹ kế → tính chênh lệch. Và một cách test mới: fake daemon bằng `httptest` cho phép chạy **client Moby thật** mà không cần Docker.
+
+### Phase 2 (đã thống nhất để sau)
+
+| Tính năng | Học được gì |
+|---|---|
+| Volumes, Networks | Thêm view trên cùng khuôn `filterTable` |
+| Nhóm theo Docker Compose project | Nhóm/gập dòng trong bảng, label `com.docker.compose.*` |
+| Chọn docker context (`:ctx`) | Đọc `~/.docker/contexts`, tạo lại client như kboba đổi kube context |
+| `pull` image (có tiến trình) | Stream JSON tiến trình của từng layer, progress bar |
+| `prune` (containers đã dừng, images không dùng) | Thao tác hàng loạt, xác nhận kèm con số sẽ bị xoá |
+| `exec` vào shell của container | `tea.ExecProcess`: tạm nhường terminal cho `docker exec -it` rồi quay lại TUI |
+| Cột CPU/MEM ngay trong bảng containers | Nhiều stream stats song song hoặc lấy mẫu một lần có giới hạn |
 

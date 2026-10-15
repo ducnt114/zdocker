@@ -14,6 +14,7 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"math"
 	"net/http"
 	"regexp"
 	"slices"
@@ -150,6 +151,8 @@ func (d *daemon) containerEndpoint(w http.ResponseWriter, r *http.Request, ref, 
 		})
 	case "GET logs":
 		streamLogs(w, r, c)
+	case "GET stats":
+		streamStats(w, r, c)
 	case "POST start":
 		d.setState(c.ID, container.StateRunning, "Up Less than a second", events.ActionStart)
 		w.WriteHeader(http.StatusNoContent)
@@ -253,6 +256,42 @@ func (d *daemon) publishImage(id, name string, action events.Action) {
 		select {
 		case ch <- m:
 		default:
+		}
+	}
+}
+
+// streamStats writes one stats sample per second, with precpu_stats from
+// the previous sample, like the daemon. CPU and memory wander so the
+// sparklines move.
+func streamStats(w http.ResponseWriter, r *http.Request, c container.Summary) {
+	w.Header().Set("Content-Type", "application/json")
+	enc := json.NewEncoder(w)
+	flusher := w.(http.Flusher)
+	var prev container.CPUStats
+	var total, system uint64 = 0, 1_000_000_000
+	for i := 0; ; i++ {
+		running := c.State == container.StateRunning
+		if running {
+			total += uint64(100_000_000 + 80_000_000*math.Sin(float64(i)/4)) // ~10–18% of 4 CPUs
+		}
+		system += 4_000_000_000
+		cur := container.CPUStats{CPUUsage: container.CPUUsage{TotalUsage: total}, SystemUsage: system, OnlineCPUs: 4}
+		mem := uint64(120<<20 + int(30<<20*math.Sin(float64(i)/6)))
+		enc.Encode(container.StatsResponse{
+			Read: time.Now(), CPUStats: cur, PreCPUStats: prev,
+			MemoryStats: container.MemoryStats{Usage: mem + 40<<20, Limit: 1 << 30, Stats: map[string]uint64{"inactive_file": 40 << 20}},
+			Networks:    map[string]container.NetworkStats{"eth0": {RxBytes: uint64(i) * 15_000, TxBytes: uint64(i) * 4_000}},
+			PidsStats:   container.PidsStats{Current: 5},
+		})
+		flusher.Flush()
+		prev = cur
+		if r.URL.Query().Get("stream") != "true" {
+			return
+		}
+		select {
+		case <-r.Context().Done():
+			return
+		case <-time.After(time.Second):
 		}
 	}
 }

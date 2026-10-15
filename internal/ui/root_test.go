@@ -27,6 +27,7 @@ type fakeClient struct {
 	logCalls   []logCall
 	writes     []string
 	writeErr   error
+	statsCalls []context.Context
 }
 
 // ContainerLogs emits the container's canned lines and stays open (like
@@ -72,6 +73,23 @@ func (f *fakeClient) RemoveContainer(_ context.Context, id string, force bool) e
 }
 func (f *fakeClient) RemoveImage(_ context.Context, ref string, force bool) error {
 	return f.record(fmt.Sprintf("rmi %s force=%v", ref, force))
+}
+
+// ContainerStats sends two samples and stays open until ctx is cancelled.
+func (f *fakeClient) ContainerStats(ctx context.Context, id string) (<-chan docker.Stats, <-chan error, error) {
+	f.mu.Lock()
+	f.statsCalls = append(f.statsCalls, ctx)
+	f.mu.Unlock()
+	ch := make(chan docker.Stats, 2)
+	now := time.Now()
+	ch <- docker.Stats{Time: now, CPUPercent: 10, MemUsed: 100 << 20, MemLimit: 1 << 30, MemPercent: 9.8, PIDs: 3}
+	ch <- docker.Stats{Time: now, CPUPercent: 42.5, MemUsed: 200 << 20, MemLimit: 1 << 30, MemPercent: 19.5,
+		NetRx: 1_200_000, NetTx: 340_000, BlockRead: 4_100, BlockWrite: 8_200, PIDs: 7}
+	go func() {
+		<-ctx.Done()
+		close(ch)
+	}()
+	return ch, make(chan error, 1), nil
 }
 
 type logCall struct {
@@ -668,5 +686,64 @@ func TestReadOnlyMode(t *testing.T) {
 	m = send(t, m, press("x"))
 	if m.confirm != nil || !m.statusIsErr || !strings.Contains(m.status, "--read-only") || len(f.writes) != 0 {
 		t.Fatalf("confirm=%v status=%q writes=%v", m.confirm != nil, m.status, f.writes)
+	}
+}
+
+func TestStatsView(t *testing.T) {
+	f := newFake()
+	m := startModel(t, f)
+	m = send(t, m, press("j")) // web
+	m = send(t, m, press("t"))
+	if m.active != viewStats || len(f.statsCalls) != 1 {
+		t.Fatalf("active=%v calls=%d", m.active, len(f.statsCalls))
+	}
+	view := ansi.Strip(m.stats.View())
+	for _, want := range []string{"Stats web", "42.5%", "200MiB / 1GiB (19.5%)", "↓ 1.2MB  ↑ 340kB", "read 4.1kB  write 8.2kB", "peak 42.5%"} {
+		if !strings.Contains(view, want) {
+			t.Errorf("missing %q in:\n%s", want, view)
+		}
+	}
+
+	// History is capped; samples of an old stream are ignored.
+	many := make([]docker.Stats, 70)
+	m = send(t, m, statsSamplesMsg{gen: m.stats.gen, samples: many})
+	if len(m.stats.history) != statsHistory {
+		t.Fatalf("history = %d", len(m.stats.history))
+	}
+	m = send(t, m, statsSamplesMsg{gen: m.stats.gen - 1, samples: []docker.Stats{{CPUPercent: 999}}})
+	if m.stats.history[len(m.stats.history)-1].CPUPercent == 999 {
+		t.Fatal("stale sample applied")
+	}
+
+	m = send(t, m, press("esc"))
+	if m.active != viewContainers || f.statsCalls[0].Err() == nil {
+		t.Fatal("leaving the stats view must cancel the stream")
+	}
+}
+
+func TestSparkline(t *testing.T) {
+	if got := sparkline([]float64{0, 25, 50, 75, 100}, 10, 1); got != "▁▂▄▆█" {
+		t.Errorf("got %q", got)
+	}
+	// Only the last width values are drawn.
+	if got := sparkline([]float64{100, 0, 0}, 2, 1); got != "▁▁" {
+		t.Errorf("got %q", got)
+	}
+	// Values are scaled against max(peak, floor): tiny values stay low
+	// instead of filling the whole height.
+	if got := sparkline([]float64{0.1, 0.2}, 5, 1); got != "▁▂" {
+		t.Errorf("got %q", got)
+	}
+	if got := sparkline([]float64{0.1, 0.2}, 5, 0.01); got != "▄█" {
+		t.Errorf("without a meaningful floor, got %q", got)
+	}
+}
+
+func TestFormatBinary(t *testing.T) {
+	tests := map[uint64]string{0: "0B", 512: "512B", 1536: "1.5KiB", 200 << 20: "200MiB", 1 << 30: "1GiB", 3 * (1 << 29): "1.5GiB"}
+	for in, want := range tests {
+		if got := formatBinary(in); got != want {
+			t.Errorf("formatBinary(%d) = %q, want %q", in, got, want)
+		}
 	}
 }

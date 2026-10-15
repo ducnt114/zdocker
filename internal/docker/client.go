@@ -27,6 +27,10 @@ type Client interface {
 	// with stdout and stderr told apart.
 	ContainerLogs(ctx context.Context, id string, o LogOptions) (<-chan LogLine, <-chan error, error)
 
+	// ContainerStats streams resource usage samples (about one per second)
+	// until ctx is cancelled.
+	ContainerStats(ctx context.Context, id string) (<-chan Stats, <-chan error, error)
+
 	// Inspect returns `docker inspect` output (indented JSON) for a
 	// container or an image.
 	Inspect(ctx context.Context, kind Kind, id string) (string, error)

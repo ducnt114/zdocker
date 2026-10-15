@@ -9,8 +9,6 @@ zdocker is a learning project and a sibling of
 Kubernetes). See [docs/LEARNING.md](docs/LEARNING.md) (Vietnamese) for a
 phase-by-phase walkthrough.
 
-> Work in progress.
-
 ## Run
 
 Requires Go 1.24+.
@@ -63,6 +61,7 @@ header shows `● live` or `○ reconnecting`.
 | `x` | stop container (asks first) |
 | `R` | restart container (asks first) |
 | `D` | remove container / image (asks first; a running container is killed) |
+| `t` | live stats (CPU, memory, network, block I/O) with sparklines |
 | `a` | toggle all / running containers |
 | `r` | refresh |
 | `:` | command (`:containers`/`:ps`, `:images`/`:img`, `:q`) |

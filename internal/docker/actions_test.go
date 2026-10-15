@@ -14,7 +14,7 @@ import (
 // method to Client without listing it here fails the test below — on
 // purpose: a write method must also be blocked by ReadOnly.
 var (
-	readMethods  = []string{"Ping", "ListContainers", "ListImages", "ContainerLogs", "Inspect", "Events"}
+	readMethods  = []string{"Ping", "ListContainers", "ListImages", "ContainerLogs", "ContainerStats", "Inspect", "Events"}
 	writeMethods = []string{"StartContainer", "StopContainer", "RestartContainer", "RemoveContainer", "RemoveImage"}
 )
 
