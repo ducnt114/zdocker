@@ -49,8 +49,8 @@ type containersView struct {
 	// a header row per project; collapsed projects show only the header.
 	grouped   bool
 	collapsed map[string]bool
-	gen     int // bumped on every load; late results of older loads are dropped
-	now     func() time.Time
+	gen       int // bumped on every load; late results of older loads are dropped
+	now       func() time.Time
 }
 
 func newContainersView(c docker.Client) containersView {

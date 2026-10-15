@@ -13,14 +13,16 @@ import (
 // listSpec describes a simple list view: everything that differs between
 // the volumes and networks tables. listView does the rest.
 type listSpec[T any] struct {
-	title   string
-	load    func(ctx context.Context, c docker.Client) ([]T, error)
-	key     func(T) string
-	row     func(item T, now time.Time) tableRow // row.key is set from key()
-	columns func(width int) []tableColumn
-	note    func(items []T) string     // shown after the title
-	inspect func(T) openInspectMsg     // i
-	remove  func(T) (actionMsg, error) // D; error = refused before asking
+	title     string
+	load      func(ctx context.Context, c docker.Client) ([]T, error)
+	key       func(T) string
+	row       func(item T, now time.Time) tableRow // row.key is set from key()
+	columns   func(width int) []tableColumn
+	note      func(items []T) string     // shown after the title
+	inspect   func(T) openInspectMsg     // i (optional)
+	remove    func(T) (actionMsg, error) // D; error = refused before asking (optional)
+	enter     func(T) tea.Msg            // enter (optional)
+	enterHelp string
 }
 
 // listLoadedMsg is generic too: listLoadedMsg[docker.Volume] and
@@ -102,10 +104,13 @@ func (v listView[T]) Update(msg tea.Msg) (listView[T], tea.Cmd) {
 			switch {
 			case key.Matches(msg, refreshKey):
 				return v, v.load()
-			case key.Matches(msg, inspectKey) && ok:
+			case key.Matches(msg, inspectKey) && ok && v.spec.inspect != nil:
 				m := v.spec.inspect(item)
 				return v, func() tea.Msg { return m }
-			case key.Matches(msg, actionKeys.Remove) && ok:
+			case key.Matches(msg, containerKeyMap.Logs) && ok && v.spec.enter != nil:
+				m := v.spec.enter(item)
+				return v, func() tea.Msg { return m }
+			case key.Matches(msg, actionKeys.Remove) && ok && v.spec.remove != nil:
 				a, err := v.spec.remove(item)
 				if err != nil {
 					return v, reportErr(err)
@@ -138,8 +143,14 @@ func (v listView[T]) View() string {
 func (v listView[T]) capturingInput() bool { return v.table.Capturing() }
 
 func (v listView[T]) keys(readOnly bool) []key.Binding {
-	b := []key.Binding{containerKeyMap.Up, containerKeyMap.Down, inspectKey}
-	if !readOnly {
+	b := []key.Binding{containerKeyMap.Up, containerKeyMap.Down}
+	if v.spec.enter != nil {
+		b = append(b, key.NewBinding(key.WithKeys("enter"), key.WithHelp("enter", v.spec.enterHelp)))
+	}
+	if v.spec.inspect != nil {
+		b = append(b, inspectKey)
+	}
+	if !readOnly && v.spec.remove != nil {
 		b = append(b, actionKeys.Remove)
 	}
 	b = append(b, refreshKey)

@@ -21,8 +21,11 @@ make build
 `--read-only` disables every change (start, stop, restart, remove): it is
 enforced in the client, not just hidden in the UI.
 
-Without `--host`, zdocker connects like the `docker` CLI: `$DOCKER_HOST`
-(and `$DOCKER_TLS_VERIFY`, `$DOCKER_CERT_PATH`), else the local socket.
+zdocker uses the docker CLI's contexts: `--context NAME` (default: the
+CLI's current one, honouring `$DOCKER_CONTEXT` and `$DOCKER_HOST`), and
+`:ctx` inside the app to switch — in memory only, the CLI config is never
+changed. `unix://` and `tcp://` (TLS) endpoints are supported; `ssh://`
+contexts are not yet. `--host` overrides contexts.
 
 ### Without Docker
 
@@ -65,7 +68,7 @@ header shows `● live` or `○ reconnecting`.
 | `a` | toggle all / running containers |
 | `g` | group containers by Docker Compose project (`enter` on a project folds it) |
 | `r` | refresh |
-| `:` | command (`:containers`/`:ps`, `:images`/`:img`, `:volumes`/`:vol`, `:networks`/`:net`, `:q`) |
+| `:` | command (`:containers`/`:ps`, `:images`/`:img`, `:volumes`/`:vol`, `:networks`/`:net`, `:ctx [name]`, `:q`) |
 | `?` | help |
 | `q` | quit |
 

@@ -29,12 +29,15 @@ const (
 	viewStats
 	viewVolumes
 	viewNetworks
+	viewContexts
 )
 
-// connectedMsg reports the result of the initial Ping.
+// connectedMsg reports the result of a Ping. client says which client it
+// was for: after a context switch, a late answer for the old one is ignored.
 type connectedMsg struct {
-	info docker.ServerInfo
-	err  error
+	client docker.Client
+	info   docker.ServerInfo
+	err    error
 }
 
 // Options are startup settings, usually from flags.
@@ -42,6 +45,13 @@ type Options struct {
 	// ReadOnly hides the write actions; the client given to New should
 	// then be docker.ReadOnly(…) so they can't run anyway.
 	ReadOnly bool
+
+	// Context is the name of the docker context in use ("" if --host was
+	// given). Contexts lists them and Connect builds a client for one;
+	// both may be nil (no context switching).
+	Context  string
+	Contexts func() ([]docker.Context, error)
+	Connect  func(name string) (docker.Client, error)
 }
 
 // Model is the root Bubble Tea model.
@@ -63,6 +73,12 @@ type Model struct {
 	stats      statsView
 	volumes    listView[docker.Volume]
 	networks   listView[docker.Network]
+	contexts   listView[docker.Context]
+	// ctx is the docker context in use. It is a pointer so that the
+	// contexts view (which keeps a closure reading it) sees updates: the
+	// Model itself is copied on every Update, a closure over one copy
+	// would keep reading a stale value.
+	ctx *activeContext
 	// returnTo is the table logs/inspect go back to.
 	returnTo viewID
 
@@ -77,28 +93,44 @@ type Model struct {
 	bodyHeight    int
 }
 
+type activeContext struct{ name string }
+
 // New returns the root model for a client.
 func New(c docker.Client, opts Options) Model {
+	m := Model{opts: opts, ctx: &activeContext{name: opts.Context}, help: help.New(), status: "connecting…"}
+	m.command = newCommandInput()
+	m.useClient(c)
+	list := opts.Contexts
+	if list == nil {
+		list = func() ([]docker.Context, error) { return nil, nil }
+	}
+	ctx := m.ctx
+	m.contexts = newListView(c, contextsSpec(list, func() string { return ctx.name }))
+	return m
+}
+
+// useClient (re)creates everything that talks to the daemon. It is used
+// at startup and when switching context: views start empty with the new
+// client, and the old event stream must have been stopped by the caller.
+func (m *Model) useClient(c docker.Client) {
+	m.client = c
+	m.server = docker.ServerInfo{}
+	m.events = eventsWatcher{client: c}
+	m.containers = newContainersView(c)
+	m.images = newImagesView(c)
+	m.logs = newLogsView()
+	m.inspect = newInspectView()
+	m.stats = newStatsView()
+	m.volumes = newListView(c, volumesSpec)
+	m.networks = newListView(c, networksSpec)
+	m.layout()
+}
+
+func newCommandInput() textinput.Model {
 	ti := textinput.New()
 	ti.Prompt = ":"
-	ti.Placeholder = "containers | images | volumes | networks | quit"
-
-	return Model{
-		client:     c,
-		opts:       opts,
-		events:     eventsWatcher{client: c},
-		active:     viewContainers,
-		containers: newContainersView(c),
-		images:     newImagesView(c),
-		logs:       newLogsView(),
-		inspect:    newInspectView(),
-		stats:      newStatsView(),
-		volumes:    newListView(c, volumesSpec),
-		networks:   newListView(c, networksSpec),
-		command:    ti,
-		help:       help.New(),
-		status:     "connecting…",
-	}
+	ti.Placeholder = "containers | images | volumes | networks | ctx | quit"
+	return ti
 }
 
 func (m Model) Init() tea.Cmd {
@@ -110,7 +142,7 @@ func ping(c docker.Client) tea.Cmd {
 		ctx, cancel := context.WithTimeout(context.Background(), requestTimeout)
 		defer cancel()
 		info, err := c.Ping(ctx)
-		return connectedMsg{info: info, err: err}
+		return connectedMsg{client: c, info: info, err: err}
 	}
 }
 
@@ -131,6 +163,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case connectedMsg:
+		if msg.client != m.client {
+			return m, nil // answer for a context we already left
+		}
 		if msg.err != nil {
 			// e.g. the daemon isn't running or the socket isn't readable.
 			m.status, m.statusIsErr = "cannot reach the Docker daemon: "+msg.err.Error(), true
@@ -161,6 +196,30 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, reportErr(msg.err)
 		}
 		return m, reportInfo(msg.done)
+
+	case switchContextMsg:
+		if m.opts.Connect == nil {
+			return m, reportErr(fmt.Errorf("switching contexts is not available with --host"))
+		}
+		m.status, m.statusIsErr = fmt.Sprintf("switching to context %q…", msg.name), false
+		return m, connectTo(m.opts.Connect, msg.name)
+
+	case contextSwitchedMsg:
+		if msg.err != nil {
+			return m, reportErr(msg.err) // keep using the current context
+		}
+		m.events.stop()             // the old daemon's stream
+		m.setActive(viewContainers) // stops logs/stats streams
+		m.ctx.name = msg.name
+		m.useClient(msg.client)
+		m.status, m.statusIsErr = fmt.Sprintf("connecting to context %q…", msg.name), false
+		return m, ping(m.client)
+
+	case listLoadedMsg[docker.Context]:
+		var cmd tea.Cmd
+		m.contexts, cmd = m.contexts.Update(msg)
+		m.contexts.table.Select(m.ctx.name) // start on the context in use
+		return m, cmd
 
 	case openLogsMsg:
 		m.returnTo = m.active
@@ -329,6 +388,12 @@ func (m Model) runCommand(input string) (tea.Model, tea.Cmd) {
 	case "networks", "network", "net", "n":
 		m.setActive(viewNetworks)
 		return m, nil
+	case "ctx", "context", "contexts":
+		if len(fields) > 1 {
+			return m.Update(switchContextMsg{name: fields[1]})
+		}
+		m.setActive(viewContexts)
+		return m, m.contexts.load()
 	case "q", "quit":
 		return m, tea.Quit
 	}
@@ -365,6 +430,8 @@ func (m Model) updateActive(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.volumes, cmd = m.volumes.Update(msg)
 	case viewNetworks:
 		m.networks, cmd = m.networks.Update(msg)
+	case viewContexts:
+		m.contexts, cmd = m.contexts.Update(msg)
 	}
 	return m, cmd
 }
@@ -385,6 +452,8 @@ func (m Model) activeCapturingInput() bool {
 		return m.volumes.capturingInput()
 	case viewNetworks:
 		return m.networks.capturingInput()
+	case viewContexts:
+		return m.contexts.capturingInput()
 	}
 	return false
 }
@@ -405,6 +474,8 @@ func (m Model) activeKeys() helpKeys {
 		return helpKeys{view: m.volumes.keys(m.opts.ReadOnly)}
 	case viewNetworks:
 		return helpKeys{view: m.networks.keys(m.opts.ReadOnly)}
+	case viewContexts:
+		return helpKeys{view: m.contexts.keys(m.opts.ReadOnly)}
 	}
 	return helpKeys{}
 }
@@ -423,6 +494,7 @@ func (m *Model) layout() {
 	m.stats.SetSize(m.width, m.bodyHeight)
 	m.volumes.SetSize(m.width, m.bodyHeight)
 	m.networks.SetSize(m.width, m.bodyHeight)
+	m.contexts.SetSize(m.width, m.bodyHeight)
 }
 
 func (m Model) View() string {
@@ -445,6 +517,8 @@ func (m Model) View() string {
 		body = m.volumes.View()
 	case viewNetworks:
 		body = m.networks.View()
+	case viewContexts:
+		body = m.contexts.View()
 	}
 	// Pin the body height so the status and help bars stay at the bottom.
 	body = lipgloss.NewStyle().Height(m.bodyHeight).MaxHeight(m.bodyHeight).Render(body)
@@ -457,6 +531,9 @@ func (m Model) headerView() string {
 		host = "-"
 	}
 	info := "host: " + host
+	if m.ctx.name != "" {
+		info = "ctx: " + m.ctx.name + "  " + info
+	}
 	if m.server.APIVersion != "" {
 		info += "  api: " + m.server.APIVersion
 	}

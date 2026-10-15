@@ -941,3 +941,102 @@ func TestGroupHeaderIgnoresContainerActions(t *testing.T) {
 		t.Fatalf("actions on a header: confirm=%v writes=%v active=%v", m.confirm != nil, f.writes, m.active)
 	}
 }
+
+// contextWorld is a set of docker contexts, each with its own fake daemon.
+type contextWorld struct {
+	daemons  map[string]*fakeClient
+	connects []string
+}
+
+func (w *contextWorld) options(current string) Options {
+	return Options{
+		Context: current,
+		Contexts: func() ([]docker.Context, error) {
+			return []docker.Context{
+				{Name: "default", Host: "unix:///var/run/docker.sock", Current: true},
+				{Name: "colima", Host: "unix:///home/me/.colima/docker.sock"},
+				{Name: "far", Host: "ssh://me@far"},
+			}, nil
+		},
+		Connect: func(name string) (docker.Client, error) {
+			w.connects = append(w.connects, name)
+			if name == "far" {
+				return nil, errors.New(`context "far" uses ssh: not supported yet`)
+			}
+			return w.daemons[name], nil
+		},
+	}
+}
+
+func TestSwitchContext(t *testing.T) {
+	colima := newFake()
+	colima.containers = []docker.Container{{ID: "z1", Name: "on-colima", State: "running"}}
+	w := &contextWorld{daemons: map[string]*fakeClient{"default": newFake(), "colima": colima}}
+	m := startModelWith(t, w.daemons["default"], w.options("default"))
+	oldStream := w.daemons["default"].streams[0]
+
+	m = typeCommand(t, m, "ctx")
+	if m.active != viewContexts {
+		t.Fatalf("active = %v", m.active)
+	}
+	rows := m.contexts.table.table.rows
+	if len(rows) != 3 || rows[0][0] != "* default" || rows[0][3] != "current" || rows[1][0] != "  colima" {
+		t.Fatalf("rows = %v", rows)
+	}
+
+	if k, _ := m.contexts.table.Selected(); k != "default" {
+		t.Fatalf("the cursor should start on the context in use, got %q", k)
+	}
+	m = send(t, m, press("j"))
+	m = send(t, m, press("enter"))
+	if m.active != viewContainers || m.client != docker.Client(colima) {
+		t.Fatalf("active=%v client switched=%v", m.active, m.client == docker.Client(colima))
+	}
+	if oldStream.Err() == nil {
+		t.Fatal("the old daemon's event stream must be stopped")
+	}
+	if got := names(m.containers.table.table.rows); len(got) != 1 || got[0] != "on-colima" {
+		t.Fatalf("containers = %v", got)
+	}
+	if !strings.Contains(ansi.Strip(m.View()), "ctx: colima") {
+		t.Fatal("header should show the new context")
+	}
+
+	// The contexts view marks the one in use (not the CLI's current one).
+	m = typeCommand(t, m, "ctx")
+	if rows := m.contexts.table.table.rows; rows[1][0] != "* colima" || rows[0][0] != "  default" {
+		t.Fatalf("rows = %v", rows)
+	}
+	if k, _ := m.contexts.table.Selected(); k != "colima" {
+		t.Fatalf("cursor on %q, want the active colima", k)
+	}
+
+	// A late ping answer from the old client is ignored.
+	m = send(t, m, connectedMsg{client: w.daemons["default"], err: errors.New("old")})
+	if m.statusIsErr {
+		t.Fatalf("stale ping applied: %q", m.status)
+	}
+}
+
+func TestSwitchContextFailureKeepsCurrent(t *testing.T) {
+	w := &contextWorld{daemons: map[string]*fakeClient{"default": newFake()}}
+	m := startModelWith(t, w.daemons["default"], w.options("default"))
+	m = typeCommand(t, m, "ctx far")
+	if !m.statusIsErr || !strings.Contains(m.status, "ssh") || m.client != docker.Client(w.daemons["default"]) {
+		t.Fatalf("status=%q", m.status)
+	}
+	if len(w.daemons["default"].streams) != 1 || w.daemons["default"].streams[0].Err() != nil {
+		t.Fatal("a failed switch must not touch the current connection")
+	}
+}
+
+func TestSwitchContextStopsLogs(t *testing.T) {
+	w := &contextWorld{daemons: map[string]*fakeClient{"default": newFake(), "colima": newFake()}}
+	m := startModelWith(t, w.daemons["default"], w.options("default"))
+	m = send(t, m, press("enter")) // logs of the first container
+	logCtx := w.daemons["default"].logCalls[0].ctx
+	m = typeCommand(t, m, "ctx colima")
+	if logCtx.Err() == nil || m.active != viewContainers {
+		t.Fatal("switching context must stop the log stream")
+	}
+}

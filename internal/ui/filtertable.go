@@ -183,6 +183,13 @@ func reverseWithinGroups(rows []tableRow) {
 	}
 }
 
+// Select puts the cursor on the row with key k, if it is visible.
+func (t *filterTable) Select(k string) {
+	if i := slices.IndexFunc(t.visible, func(r tableRow) bool { return r.key == k }); i >= 0 {
+		t.table.SetCursor(i)
+	}
+}
+
 // Selected returns the key of the row under the cursor.
 func (t filterTable) Selected() (string, bool) {
 	i := t.table.Cursor()

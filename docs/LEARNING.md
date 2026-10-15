@@ -20,6 +20,7 @@ zdocker là "anh em" của [kboba](https://github.com/ducnt114/kboba): cùng ki�
 
 10. [Phase 2.1: Volumes và Networks](#10-phase-21-volumes-và-networks)
 11. [Phase 2.2: Nhóm theo Compose project](#11-phase-22-nhóm-theo-compose-project)
+12. [Phase 2.3: Docker context](#12-phase-23-docker-context)
 
 ---
 
@@ -423,7 +424,7 @@ So với kboba, zdocker cho thấy cùng một kiến trúc Bubble Tea áp vào 
 |---|---|---|---|
 | 2.1 | Volumes, Networks | View generic `listView[T]`, message generic | ✅ [mục 10](#10-phase-21-volumes-và-networks) |
 | 2.2 | Nhóm theo Docker Compose project | Nhóm/gập dòng trong bảng, label `com.docker.compose.*` | ✅ [mục 11](#11-phase-22-nhóm-theo-compose-project) |
-| 2.3 | Chọn docker context (`:ctx`) | Đọc `~/.docker/contexts`, tạo lại client như kboba đổi kube context | ⏳ |
+| 2.3 | Chọn docker context (`:ctx`) | Đọc `~/.docker/contexts`, tạo lại client như kboba đổi kube context | ✅ [mục 12](#12-phase-23-docker-context) |
 | 2.4 | `pull` image (có tiến trình) | Stream JSON tiến trình của từng layer, progress bar | ⏳ |
 | 2.5 | `prune` (containers đã dừng, images dangling) | Thao tác hàng loạt, xác nhận kèm con số sẽ bị xoá | ⏳ |
 | 2.6 | `exec` vào shell của container | `tea.ExecProcess`: tạm nhường terminal cho `docker exec -it` rồi quay lại TUI | ⏳ |
@@ -544,4 +545,52 @@ Bảng không nhóm (images, volumes…) có mọi dòng cùng `group == ""` →
 | Thao tác container chạy trên dòng tiêu đề | Tiêu đề có key không nằm trong `items` → `selected()` false |
 | `g` của table (về đầu) bị che | Dùng `Home`; ghi chú trong help |
 | Test giả định con trỏ nhảy lên tiêu đề sau khi nhóm | Hành vi đúng là giữ container đang chọn; test điều hướng tường minh |
+
+## 12. Phase 2.3: Docker context
+
+### Mục tiêu
+- `--context <tên>` lúc khởi động; mặc định là context hiện tại của CLI `docker`.
+- `:ctx` hiện các context (NAME, DOCKER ENDPOINT, TLS, CLI = context hiện tại của CLI, DESCRIPTION), `*` đánh dấu context zdocker đang dùng, con trỏ bắt đầu ở đó; `enter` hoặc `:ctx <tên>` chuyển sang context khác.
+- Chuyển context **chỉ trong bộ nhớ**: không bao giờ ghi `~/.docker/config.json` (đúng nguyên tắc kboba áp cho kubeconfig).
+- Endpoint `unix://`, `tcp://` (kèm TLS) được hỗ trợ; `ssh://` báo lỗi rõ ràng (xem Bẫy).
+
+### Học được gì
+- **CLI `docker` lưu context thế nào**: `$DOCKER_CONFIG` (mặc định `~/.docker`) → `contexts/meta/<sha256(tên)>/meta.json` (`Name`, `Metadata.Description`, `Endpoints.docker.Host`) và chứng chỉ ở `contexts/tls/<sha256(tên)>/docker/{ca,cert,key}.pem`. Thư mục đặt theo **SHA-256 của tên** vì tên có thể chứa ký tự không hợp lệ trong đường dẫn.
+- **Thứ tự ưu tiên** chọn context: `DOCKER_HOST` (→ `default`) > `DOCKER_CONTEXT` > `currentContext` trong `config.json` > `default`. Context `default` = `DOCKER_HOST` hoặc socket local.
+- **Context khác `default` bỏ qua `DOCKER_HOST`**: không dùng `client.FromEnv` cho chúng, chỉ `WithHost` + `WithTLSClientConfig`.
+- **Đổi "kết nối" giữa chừng trong Elm**: dừng mọi thứ của kết nối cũ (event stream, stream logs/stats), dựng lại mọi view với client mới, ping lại. Và bỏ qua câu trả lời muộn của client cũ.
+- **Closure + model truyền theo giá trị = dữ liệu cũ**: bài học quan trọng nhất của phase này (xem Bẫy).
+
+### Thể hiện trong code
+
+**`internal/docker/contexts.go`**:
+- `ConfigDir()`, `ListContexts(configDir)` (luôn có `default` đứng đầu, các context khác sắp theo tên, thư mục không có `meta.json` bị bỏ qua, không có thư mục contexts → chỉ `default`), `currentContextName` (thứ tự ưu tiên ở trên), `contextID` (SHA-256 hex).
+- `NewForContext(c)`: `default` → `New("")` (đọc env); `ssh://` → lỗi; còn lại → `WithHost(c.Host)` (+ `WithTLSClientConfig` nếu có `ca.pem`).
+
+**`cmd/zdocker/main.go`**: `connect(name)` = đọc lại danh sách context → `FindContext` → `NewForContext` → bọc `ReadOnly` nếu `--read-only`. `--host` vẫn ưu tiên hơn `--context`. Tên context sai → thoát với lỗi *trước khi* mở TUI (như kboba).
+
+**UI**:
+- `Options{Context, Contexts, Connect}` — UI không biết context được lưu ở đâu, chỉ nhận hai hàm.
+- View contexts là một `listView[docker.Context]` (`contexts.go` → `contextsSpec`); `listSpec` có thêm `enter`/`enterHelp` tuỳ chọn, và `inspect`/`remove` giờ là tuỳ chọn (nil → phím không làm gì và biến khỏi help).
+- `switchContextMsg` → `connectTo` (Cmd: đọc file TLS, dựng client) → `contextSwitchedMsg`:
+  - lỗi → báo lỗi, **giữ nguyên** kết nối hiện tại;
+  - thành công → `events.stop()`, `setActive(viewContainers)` (dừng logs/stats), `useClient(newClient)` (dựng lại containers, images, volumes, networks, logs, inspect, stats và watcher), `ping`.
+- `useClient` cũng được `New` dùng lúc khởi động → một đường duy nhất để "gắn một client".
+- `connectedMsg` mang theo `client`: `msg.client != m.client` → câu trả lời của context đã bỏ, bỏ qua.
+- Header: `ctx: lab-b  host: tcp://…`.
+
+### Test liên quan
+- `internal/docker/contexts_test.go`: `TestListContexts` (tạo context đúng cấu trúc của CLI: SHA-256, meta.json, tls; `config.json` → current; `DOCKER_CONTEXT` thắng `config.json`; `DOCKER_HOST` thắng tất cả và đổi host của `default`), `TestListContextsWithoutConfig`, `TestNewForContext` (context tcp kết nối fake daemon dù `DOCKER_HOST` trỏ chỗ khác; ssh → lỗi).
+- `internal/ui/root_test.go`: `TestSwitchContext` (dòng `* default`/`current`, con trỏ ở context đang dùng, enter chuyển sang colima: event stream cũ bị huỷ, bảng hiện container của daemon mới, header đổi, `*` chuyển sang colima, ping muộn của client cũ bị bỏ qua), `TestSwitchContextFailureKeepsCurrent`, `TestSwitchContextStopsLogs`.
+- Thủ công: `DOCKER_CONFIG` tạm với 3 context (2 tcp tới 2 fake daemon, 1 ssh); chuyển `lab-a` → `lab-b`; `:ctx far` báo lỗi ssh; `--context nope` thoát với lỗi.
+
+### Bẫy
+| Bẫy | Cách xử lý |
+|---|---|
+| Closure trong `New` bắt biến cục bộ `m`; Model được copy ở mỗi `Update` → closure đọc mãi giá trị cũ (dấu `*` không bao giờ di chuyển) | Giữ tên context trong `*activeContext` dùng chung giữa các bản copy |
+| `client.FromEnv` cho mọi context → `DOCKER_HOST` đè lên endpoint của context | Chỉ `default` đọc env |
+| Ping muộn của context cũ ghi đè trạng thái context mới | `connectedMsg.client` so với `m.client` |
+| Quên dừng stream của kết nối cũ khi chuyển | `events.stop()` + `setActive` (dừng logs/stats) trước `useClient` |
+| Con trỏ ở dòng đầu thay vì context đang dùng → Enter nhầm | `filterTable.Select(active)` mỗi lần danh sách được nạp |
+| Context `ssh://`: CLI chạy `ssh … docker system dial-stdio` và nối stdin/stdout làm kết nối | Chưa hỗ trợ (cần SSH server để kiểm chứng) — báo lỗi rõ ràng thay vì làm một nửa; có thể làm sau bằng `client.WithDialContext` + một `net.Conn` bọc tiến trình `ssh` |
 
