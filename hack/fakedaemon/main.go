@@ -158,6 +158,10 @@ func (d *daemon) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		d.mu.Unlock()
 	case "POST /images/create":
 		d.pull(w, r)
+	case "POST /containers/prune":
+		d.pruneContainers(w)
+	case "POST /images/prune":
+		d.pruneImages(w)
 	case "GET /volumes":
 		d.mu.Lock()
 		writeJSON(w, map[string]any{"Volumes": d.volumes})
@@ -305,6 +309,40 @@ func (d *daemon) removeImage(w http.ResponseWriter, r *http.Request, ref string)
 		return
 	}
 	jsonError(w, `{"message":"No such image: `+ref+`"}`, http.StatusNotFound)
+}
+
+func (d *daemon) pruneContainers(w http.ResponseWriter) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	var deleted []string
+	d.containers = slices.DeleteFunc(d.containers, func(c container.Summary) bool {
+		switch c.State {
+		case container.StateExited, container.StateCreated, container.StateDead:
+			deleted = append(deleted, c.ID)
+			d.publish(c.ID, strings.TrimPrefix(c.Names[0], "/"), events.ActionDestroy)
+			return true
+		}
+		return false
+	})
+	writeJSON(w, map[string]any{"ContainersDeleted": deleted, "SpaceReclaimed": uint64(len(deleted)) * 1_200_000})
+}
+
+// pruneImages removes dangling images no container uses.
+func (d *daemon) pruneImages(w http.ResponseWriter) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	var deleted []map[string]string
+	var space int64
+	d.images = slices.DeleteFunc(d.images, func(img image.Summary) bool {
+		if len(img.RepoTags) > 0 || slices.ContainsFunc(d.containers, func(c container.Summary) bool { return c.ImageID == img.ID }) {
+			return false
+		}
+		deleted = append(deleted, map[string]string{"Deleted": img.ID})
+		space += img.Size
+		d.publishImage(img.ID, img.ID, events.ActionDelete)
+		return true
+	})
+	writeJSON(w, map[string]any{"ImagesDeleted": deleted, "SpaceReclaimed": space})
 }
 
 // pull streams `docker pull` progress for three layers over ~3 seconds,

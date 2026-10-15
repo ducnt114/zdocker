@@ -44,6 +44,12 @@ those.
 `f` follow, `/` `n` `N` search, `w` wrap, `t` timestamps, `←/→` scroll,
 `esc` back. Lines written to stderr are marked with a red bar.
 
+## Cleaning up
+
+`:prune` removes stopped containers and dangling images (never volumes or
+tagged images). It shows what would go — counts, a few names, the size —
+and asks first; afterwards it reports what the daemon actually removed.
+
 ## Live updates
 
 zdocker lists containers once, then follows the daemon's event stream and
@@ -69,7 +75,7 @@ header shows `● live` or `○ reconnecting`.
 | `a` | toggle all / running containers |
 | `g` | group containers by Docker Compose project (`enter` on a project folds it) |
 | `r` | refresh |
-| `:` | command (`:containers`/`:ps`, `:images`/`:img`, `:volumes`/`:vol`, `:networks`/`:net`, `:ctx [name]`, `:pull image[:tag]`, `:q`) |
+| `:` | command (`:containers`/`:ps`, `:images`/`:img`, `:volumes`/`:vol`, `:networks`/`:net`, `:ctx [name]`, `:pull image[:tag]`, `:prune`, `:q`) |
 | `?` | help |
 | `q` | quit |
 

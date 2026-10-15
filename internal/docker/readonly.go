@@ -29,3 +29,4 @@ func (readOnly) RemoveNetwork(context.Context, string) error         { return Er
 func (readOnly) PullImage(context.Context, string) (<-chan PullProgress, error) {
 	return nil, ErrReadOnly
 }
+func (readOnly) Prune(context.Context) (PruneReport, error) { return PruneReport{}, ErrReadOnly }

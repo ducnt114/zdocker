@@ -32,6 +32,9 @@ type actionMsg struct {
 	progress string // shown while running, e.g. "stopping web…"
 	done     string // shown on success, e.g. "web stopped"
 	run      func(ctx context.Context, c docker.Client) error
+	// report (optional) replaces done with a text built after run, e.g.
+	// what a prune actually removed.
+	report func() string
 }
 
 type actionDoneMsg struct {
@@ -107,7 +110,12 @@ func runAction(c docker.Client, a actionMsg) tea.Cmd {
 	return func() tea.Msg {
 		ctx, cancel := context.WithTimeout(context.Background(), actionTimeout)
 		defer cancel()
-		return actionDoneMsg{done: a.done, err: a.run(ctx, c)}
+		err := a.run(ctx, c)
+		done := a.done
+		if a.report != nil && err == nil {
+			done = a.report()
+		}
+		return actionDoneMsg{done: done, err: err}
 	}
 }
 

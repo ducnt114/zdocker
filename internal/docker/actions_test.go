@@ -15,7 +15,7 @@ import (
 // purpose: a write method must also be blocked by ReadOnly.
 var (
 	readMethods  = []string{"Ping", "ListContainers", "ListImages", "ListVolumes", "ListNetworks", "ContainerLogs", "ContainerStats", "Inspect", "Events"}
-	writeMethods = []string{"StartContainer", "StopContainer", "RestartContainer", "RemoveContainer", "RemoveImage", "RemoveVolume", "RemoveNetwork", "PullImage"}
+	writeMethods = []string{"StartContainer", "StopContainer", "RestartContainer", "RemoveContainer", "RemoveImage", "RemoveVolume", "RemoveNetwork", "PullImage", "Prune"}
 )
 
 func TestEveryMethodIsClassified(t *testing.T) {

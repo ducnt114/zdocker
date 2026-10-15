@@ -58,6 +58,8 @@ type Client interface {
 	RemoveNetwork(ctx context.Context, id string) error
 	// PullImage pulls an image, streaming progress snapshots.
 	PullImage(ctx context.Context, ref string) (<-chan PullProgress, error)
+	// Prune removes stopped containers and dangling images.
+	Prune(ctx context.Context) (PruneReport, error)
 }
 
 // ServerInfo describes the daemon zdocker talks to.

@@ -39,6 +39,8 @@ func (h helpKeys) FullHelp() [][]key.Binding {
 			key.NewBinding(key.WithKeys(":volumes"), key.WithHelp(":volumes", "volumes (:vol)")),
 			key.NewBinding(key.WithKeys(":networks"), key.WithHelp(":networks", "networks (:net)")),
 			key.NewBinding(key.WithKeys(":ctx"), key.WithHelp(":ctx [name]", "docker contexts")),
+			key.NewBinding(key.WithKeys(":pull"), key.WithHelp(":pull image", "pull an image")),
+			key.NewBinding(key.WithKeys(":prune"), key.WithHelp(":prune", "remove stopped containers, dangling images")),
 			key.NewBinding(key.WithKeys(":q"), key.WithHelp(":q", "quit")),
 		},
 	}

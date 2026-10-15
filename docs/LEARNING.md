@@ -22,6 +22,7 @@ zdocker là "anh em" của [kboba](https://github.com/ducnt114/kboba): cùng ki�
 11. [Phase 2.2: Nhóm theo Compose project](#11-phase-22-nhóm-theo-compose-project)
 12. [Phase 2.3: Docker context](#12-phase-23-docker-context)
 13. [Phase 2.4: Pull image](#13-phase-24-pull-image)
+14. [Phase 2.5: Prune](#14-phase-25-prune)
 
 ---
 
@@ -427,7 +428,7 @@ So với kboba, zdocker cho thấy cùng một kiến trúc Bubble Tea áp vào 
 | 2.2 | Nhóm theo Docker Compose project | Nhóm/gập dòng trong bảng, label `com.docker.compose.*` | ✅ [mục 11](#11-phase-22-nhóm-theo-compose-project) |
 | 2.3 | Chọn docker context (`:ctx`) | Đọc `~/.docker/contexts`, tạo lại client như kboba đổi kube context | ✅ [mục 12](#12-phase-23-docker-context) |
 | 2.4 | `pull` image (có tiến trình) | Stream JSON tiến trình của từng layer, progress bar | ✅ [mục 13](#13-phase-24-pull-image) |
-| 2.5 | `prune` (containers đã dừng, images dangling) | Thao tác hàng loạt, xác nhận kèm con số sẽ bị xoá | ⏳ |
+| 2.5 | `prune` (containers đã dừng, images dangling) | Thao tác hàng loạt, xác nhận kèm con số sẽ bị xoá | ✅ [mục 14](#14-phase-25-prune) |
 | 2.6 | `exec` vào shell của container | `tea.ExecProcess`: tạm nhường terminal cho `docker exec -it` rồi quay lại TUI | ⏳ |
 | 2.7 | Cột CPU/MEM ngay trong bảng containers | Nhiều stream stats song song hoặc lấy mẫu một lần có giới hạn | ⏳ |
 
@@ -636,4 +637,47 @@ Bảng không nhóm (images, volumes…) có mọi dòng cùng `group == ""` →
 | Coi `Download complete` là xong | Còn `Extracting`; chỉ `Pull complete`/`Already exists` |
 | `progress` cần module `harmonica` | `go get github.com/charmbracelet/bubbles/progress@v1.0.0` |
 | Biểu thức `a || b || c && d` dễ hiểu sai (thứ tự ưu tiên) | Viết lại cho rõ, chỉ còn hai điều kiện |
+
+## 14. Phase 2.5: Prune
+
+### Mục tiêu
+`:prune` dọn dẹp như `docker container prune` + `docker image prune` mặc định: **container đã dừng** (`exited`, `created`, `dead`) và **image dangling** (không tag). Không bao giờ đụng tới volume (dữ liệu) hay image còn tag. Trước khi làm, zdocker tính và hỏi cụ thể:
+
+`Prune: remove 2 stopped container(s) (flaky, migrate) and 1 dangling image(s) (48.1MB)?`
+
+Xong thì báo **kết quả thật** từ daemon: `removed 2 container(s), 1 image(s), reclaimed 50.5MB`. Không có gì để dọn → `nothing to prune`, không hỏi. Bị chặn khi `--read-only`.
+
+### Học được gì
+- **Thao tác hàng loạt cần câu hỏi cụ thể**: "Prune?" không đủ để người dùng quyết định; số lượng, vài cái tên (tối đa 3, phần còn lại `+N`) và dung lượng thì đủ.
+- **Xem trước và kết quả có thể khác nhau**: giữa lúc tính và lúc chạy, trạng thái có thể đổi (một container vừa dừng), và một image dangling chỉ bị xoá nếu không còn container nào dùng nó. Vì vậy câu hỏi dùng bản xem trước, còn thông báo cuối dùng **báo cáo của daemon**.
+- **Thứ tự quan trọng**: prune container *trước* image — container đã dừng vẫn "giữ" image của nó. Và nếu bước đầu lỗi thì dừng, không làm bước sau với một giả định sai.
+- **Báo cáo xoá image** liệt kê cả `Untagged` lẫn `Deleted`; chỉ `Deleted` là image thật sự bị xoá.
+
+### Thể hiện trong code
+
+**`internal/docker/prune.go` → `Prune(ctx)`**: `ContainerPrune` → (lỗi thì trả ngay) → `ImagePrune(Filters: dangling=true)` → `PruneReport{Containers, Images, SpaceReclaimed}`. Là thao tác ghi: `writeMethods` + `ReadOnly`.
+
+**`internal/ui/prune.go`**:
+- `planPrune` (Cmd): `ListContainers(all)` + `ListImages` → `prunePlan{containers []string, images, imageBytes}` (image dangling đếm theo ID, không trùng).
+- `pruneAction(plan)`: rỗng → `false`; ngược lại một `actionMsg` với câu hỏi cụ thể và `report` — closure đọc biến `report` mà `run` đã gán.
+
+**`actionMsg.report`** (mới, `actions.go`): `runAction` dùng `report()` thay cho chuỗi `done` cố định nếu có và nếu thành công.
+
+**Root**: `:prune` → `planPrune`; `prunePlanMsg` → `nothing to prune` hoặc đưa `actionMsg` qua đúng đường xác nhận như mọi thao tác khác (`return m.Update(a)` — không có đường tắt nào bỏ qua xác nhận hay kiểm tra read-only).
+
+**Fake daemon chạy được**: `POST /containers/prune`, `POST /images/prune` (chỉ image không tag và không container nào dùng), phát event `destroy`/`delete` để bảng tự cập nhật.
+
+### Test liên quan
+- `internal/docker/prune_test.go`: `TestPrune` (đếm, cộng dung lượng, `Untagged` không tính, container trước image, filter `dangling`), `TestPruneStopsOnContainerError`.
+- `internal/ui/root_test.go`: `TestPrune` (câu hỏi cụ thể, kết quả từ báo cáo), `TestPruneNothingToDo`, `TestPrunePromptListsAFewNames` (`a, b, c, +2`).
+- Thủ công: `:prune` trên fake daemon → câu hỏi, `y`, bảng còn container đang chạy, chạy lại → `nothing to prune`.
+
+### Bẫy
+| Bẫy | Cách xử lý |
+|---|---|
+| Câu hỏi chung chung cho thao tác hàng loạt | Đếm + vài tên + dung lượng |
+| Báo kết quả theo bản xem trước | Báo theo `PruneReport` của daemon |
+| Prune image trước → image của container đã dừng không bị xoá | Container trước, image sau |
+| Đếm `Untagged` như image đã xoá | Chỉ đếm `Deleted` |
+| Một đường riêng cho prune bỏ qua xác nhận/read-only | Đi qua `actionMsg` như mọi thao tác |
 

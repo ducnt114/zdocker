@@ -148,6 +148,13 @@ type pullCall struct {
 	ctx context.Context
 }
 
+func (f *fakeClient) Prune(context.Context) (docker.PruneReport, error) {
+	if err := f.record("prune"); err != nil {
+		return docker.PruneReport{}, err
+	}
+	return docker.PruneReport{Containers: 1, Images: 1, SpaceReclaimed: 53_000}, nil
+}
+
 type logCall struct {
 	id   string
 	opts docker.LogOptions
@@ -1168,5 +1175,41 @@ func TestPullFraction(t *testing.T) {
 	p.Done = true
 	if pullFraction(p) != 1 {
 		t.Error("a finished pull is 100%")
+	}
+}
+
+func TestPrune(t *testing.T) {
+	f := newFake() // api: exited; <none> image of 5kB
+	m := startModel(t, f)
+	m = typeCommand(t, m, "prune")
+	if m.confirm == nil {
+		t.Fatalf("expected a confirmation, status=%q", m.status)
+	}
+	prompt := ansi.Strip(m.View())
+	if !strings.Contains(prompt, "Prune: remove 1 stopped container(s) (api) and 1 dangling image(s) (5kB)?") {
+		t.Fatalf("prompt:\n%s", prompt)
+	}
+	m = send(t, m, press("y"))
+	if strings.Join(f.writes, "|") != "prune" || m.status != "removed 1 container(s), 1 image(s), reclaimed 53kB" {
+		t.Fatalf("writes=%v status=%q", f.writes, m.status)
+	}
+}
+
+func TestPruneNothingToDo(t *testing.T) {
+	f := newFake()
+	f.containers = f.containers[1:] // only the running web
+	f.images = f.images[1:]         // no dangling image
+	m := startModel(t, f)
+	m = typeCommand(t, m, "prune")
+	if m.confirm != nil || m.status != "nothing to prune" {
+		t.Fatalf("confirm=%v status=%q", m.confirm != nil, m.status)
+	}
+}
+
+func TestPrunePromptListsAFewNames(t *testing.T) {
+	p := prunePlan{containers: []string{"a", "b", "c", "d", "e"}}
+	a, _ := pruneAction(p)
+	if a.prompt != "Prune: remove 5 stopped container(s) (a, b, c, +2)?" {
+		t.Fatalf("prompt = %q", a.prompt)
 	}
 }

@@ -132,7 +132,7 @@ func (m *Model) useClient(c docker.Client) {
 func newCommandInput() textinput.Model {
 	ti := textinput.New()
 	ti.Prompt = ":"
-	ti.Placeholder = "containers | images | volumes | networks | ctx | pull <image> | quit"
+	ti.Placeholder = "containers | images | volumes | networks | ctx | pull <image> | prune | quit"
 	return ti
 }
 
@@ -217,6 +217,16 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.useClient(msg.client)
 		m.status, m.statusIsErr = fmt.Sprintf("connecting to context %q…", msg.name), false
 		return m, ping(m.client)
+
+	case prunePlanMsg:
+		if msg.err != nil {
+			return m, reportErr(msg.err)
+		}
+		a, ok := pruneAction(msg.plan)
+		if !ok {
+			return m, reportInfo("nothing to prune")
+		}
+		return m.Update(a) // the usual confirmation
 
 	case prefillCommandMsg:
 		m.commandMode = true
@@ -413,6 +423,12 @@ func (m Model) runCommand(input string) (tea.Model, tea.Cmd) {
 		cmd := m.pull.open(m.client, fields[1])
 		m.setActive(viewPull)
 		return m, cmd
+	case "prune":
+		if m.opts.ReadOnly {
+			return m, reportErr(docker.ErrReadOnly)
+		}
+		m.status, m.statusIsErr = "looking for what to prune…", false
+		return m, planPrune(m.client)
 	case "ctx", "context", "contexts":
 		if len(fields) > 1 {
 			return m.Update(switchContextMsg{name: fields[1]})
