@@ -123,6 +123,11 @@ func (v containersView) Update(msg tea.Msg) (containersView, tea.Cmd) {
 					return v, func() tea.Msg { return openInspectMsg{kind: docker.KindContainer, id: c.ID, name: c.Name} }
 				}
 				return v, nil
+			case key.Matches(msg, execKey):
+				if c, ok := v.selected(); ok {
+					return v, func() tea.Msg { return openShellMsg{container: c} }
+				}
+				return v, nil
 			case key.Matches(msg, statsKey):
 				if c, ok := v.selected(); ok {
 					return v, func() tea.Msg { return openStatsMsg{container: c} }
@@ -294,7 +299,7 @@ func (v containersView) keys(readOnly bool) []key.Binding {
 	b := []key.Binding{k.Up, k.Down, k.Logs, inspectKey, statsKey}
 	if !readOnly {
 		a := actionKeys
-		b = append(b, a.Start, a.Stop, a.Restart, a.Remove)
+		b = append(b, execKey, a.Start, a.Stop, a.Restart, a.Remove)
 	}
 	b = append(b, k.All, k.Group, k.Refresh)
 	return append(b, v.table.Keys()...)

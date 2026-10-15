@@ -76,6 +76,9 @@ type Model struct {
 	networks   listView[docker.Network]
 	contexts   listView[docker.Context]
 	pull       pullView
+	// shell runs `docker exec` (a field so tests can replace it).
+	shell shellRunner
+
 	// ctx is the docker context in use. It is a pointer so that the
 	// contexts view (which keeps a closure reading it) sees updates: the
 	// Model itself is copied on every Update, a closure over one copy
@@ -99,7 +102,7 @@ type activeContext struct{ name string }
 
 // New returns the root model for a client.
 func New(c docker.Client, opts Options) Model {
-	m := Model{opts: opts, ctx: &activeContext{name: opts.Context}, help: help.New(), status: "connecting…"}
+	m := Model{opts: opts, ctx: &activeContext{name: opts.Context}, shell: defaultShellRunner, help: help.New(), status: "connecting…"}
 	m.command = newCommandInput()
 	m.useClient(c)
 	list := opts.Contexts
@@ -217,6 +220,19 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.useClient(msg.client)
 		m.status, m.statusIsErr = fmt.Sprintf("connecting to context %q…", msg.name), false
 		return m, ping(m.client)
+
+	case openShellMsg:
+		if m.opts.ReadOnly {
+			return m, reportErr(docker.ErrReadOnly) // a shell can change anything
+		}
+		return m, m.shell.openShell(m.ctx.name, m.server.Host, msg.container)
+
+	case shellExitedMsg:
+		if msg.err != nil {
+			// Also the shell's own exit status (e.g. "exit status 130").
+			return m, reportErr(fmt.Errorf("shell in %s: %w", msg.name, msg.err))
+		}
+		return m, reportInfo("left the shell in " + msg.name)
 
 	case prunePlanMsg:
 		if msg.err != nil {

@@ -23,6 +23,7 @@ zdocker là "anh em" của [kboba](https://github.com/ducnt114/kboba): cùng ki�
 12. [Phase 2.3: Docker context](#12-phase-23-docker-context)
 13. [Phase 2.4: Pull image](#13-phase-24-pull-image)
 14. [Phase 2.5: Prune](#14-phase-25-prune)
+15. [Phase 2.6: Shell vào container](#15-phase-26-shell-vào-container)
 
 ---
 
@@ -429,7 +430,7 @@ So với kboba, zdocker cho thấy cùng một kiến trúc Bubble Tea áp vào 
 | 2.3 | Chọn docker context (`:ctx`) | Đọc `~/.docker/contexts`, tạo lại client như kboba đổi kube context | ✅ [mục 12](#12-phase-23-docker-context) |
 | 2.4 | `pull` image (có tiến trình) | Stream JSON tiến trình của từng layer, progress bar | ✅ [mục 13](#13-phase-24-pull-image) |
 | 2.5 | `prune` (containers đã dừng, images dangling) | Thao tác hàng loạt, xác nhận kèm con số sẽ bị xoá | ✅ [mục 14](#14-phase-25-prune) |
-| 2.6 | `exec` vào shell của container | `tea.ExecProcess`: tạm nhường terminal cho `docker exec -it` rồi quay lại TUI | ⏳ |
+| 2.6 | `exec` vào shell của container | `tea.ExecProcess`: tạm nhường terminal cho `docker exec -it` rồi quay lại TUI | ✅ [mục 15](#15-phase-26-shell-vào-container) |
 | 2.7 | Cột CPU/MEM ngay trong bảng containers | Nhiều stream stats song song hoặc lấy mẫu một lần có giới hạn | ⏳ |
 
 ---
@@ -680,4 +681,41 @@ Xong thì báo **kết quả thật** từ daemon: `removed 2 container(s), 1 im
 | Prune image trước → image của container đã dừng không bị xoá | Container trước, image sau |
 | Đếm `Untagged` như image đã xoá | Chỉ đếm `Deleted` |
 | Một đường riêng cho prune bỏ qua xác nhận/read-only | Đi qua `actionMsg` như mọi thao tác |
+
+## 15. Phase 2.6: Shell vào container
+
+### Mục tiêu
+`e` trên một container đang chạy → một shell tương tác bên trong nó (`bash` nếu image có, không thì `sh`). Thoát shell (`exit`, `ctrl+d`) → quay về zdocker đúng chỗ cũ, status báo `left the shell in web` (hoặc lỗi kèm exit status). Bị chặn khi `--read-only`.
+
+### Học được gì
+- **`tea.ExecProcess`**: Bubble Tea tạm dừng (rời alt screen, trả terminal về chế độ thường), chạy một `*exec.Cmd` với stdin/stdout/stderr của terminal, chờ nó kết thúc, rồi khôi phục TUI và gửi một message qua callback. Mọi thứ thuộc về "terminal" — raw mode, resize, tín hiệu — do chương trình con tự lo.
+- **Khi nào nên gọi CLI thay vì API**: `docker exec -it` qua API nghĩa là: tạo exec, *hijack* kết nối HTTP thành một luồng hai chiều, đưa terminal vào raw mode, chuyển tiếp resize (`SIGWINCH`), xử lý TTY/không TTY… CLI đã làm đúng tất cả. Đổi lại, zdocker cần `docker` trong PATH — và báo rõ khi thiếu.
+- **Cùng một daemon**: lệnh con phải nói chuyện với đúng daemon zdocker đang dùng → `--context <tên>` nếu dùng context, `-H <host>` nếu chạy bằng `--host`, không cờ nào với context `default` (CLI đọc cùng biến môi trường).
+- **Chọn shell bằng một script nhỏ**: `if command -v bash >/dev/null 2>&1; then exec bash; else exec sh; fi` — `exec` để shell thay thế `sh` trung gian (thoát một lần là ra).
+- **Test thứ không chạy được trong môi trường test**: hàm tạo lệnh (`lookPath`, `command`) là field của `shellRunner` → test thay bằng hàm ghi lại tham số; smoke test dùng một script `docker` giả trong `PATH`.
+
+### Thể hiện trong code
+
+**`internal/ui/exec.go`**:
+- `execArgs(contextName, host, container)` — dòng lệnh docker (hàm thuần, test bằng bảng).
+- `shellRunner{lookPath, command}` + `defaultShellRunner` (dùng `exec.LookPath`, `exec.Command`).
+- `openShell`: container không chạy → lỗi; không có `docker` → lỗi; ngược lại `tea.ExecProcess(cmd, func(err error) tea.Msg { return shellExitedMsg{…} })`.
+
+**Root**: `openShellMsg` (từ phím `e` của bảng containers) → read-only thì lỗi; không thì `m.shell.openShell(m.ctx.name, m.server.Host, container)`. `shellExitedMsg` → `left the shell in …` hoặc lỗi (bao gồm exit status khác 0 của chính shell). `Model.shell` là field để test thay được.
+
+**Read-only**: lần này kiểm tra ở UI, vì exec không đi qua `docker.Client` (không có method nào để `ReadOnly` chặn) — ghi chú lại để không ai tưởng client đã chặn nó.
+
+### Test liên quan
+- `internal/ui/root_test.go`: `TestExecArgs` (default → không cờ, context → `--context`, `--host` → `-H`), `TestOpenShell` (đúng dòng lệnh qua `command` giả, container dừng → lỗi, không có CLI → lỗi), `TestShellReadOnlyAndExit`.
+- Thủ công: script `docker` giả in tham số và ngủ 2 giây; tmux cho thấy TUI nhường màn hình (`FAKE docker CLI got: -H tcp://… exec -it <id> sh -c …`) rồi quay lại với `left the shell in api`.
+
+### Bẫy
+| Bẫy | Cách xử lý |
+|---|---|
+| Tự cài `docker exec -it` qua API (raw mode, resize, hijack) | Dùng CLI qua `tea.ExecProcess` |
+| Shell nói chuyện với daemon khác zdocker | Truyền `--context`/`-H` tương ứng |
+| Image không có `bash` | Script chọn `bash` hoặc `sh` |
+| Shell trên container đã dừng | Kiểm tra `State == running` trước |
+| `--read-only` không chặn exec (không qua client) | Kiểm tra ở root |
+| Không chạy được CLI thật trong test | `shellRunner` với hàm thay được; script `docker` giả khi smoke test |
 

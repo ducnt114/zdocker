@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"os/exec"
 	"strings"
 	"sync"
 	"testing"
@@ -1211,5 +1212,72 @@ func TestPrunePromptListsAFewNames(t *testing.T) {
 	a, _ := pruneAction(p)
 	if a.prompt != "Prune: remove 5 stopped container(s) (a, b, c, +2)?" {
 		t.Fatalf("prompt = %q", a.prompt)
+	}
+}
+
+func TestExecArgs(t *testing.T) {
+	c := docker.Container{ID: "abc123", Name: "web", State: "running"}
+	tests := []struct {
+		ctx, host  string
+		wantPrefix string
+	}{
+		{"default", "unix:///var/run/docker.sock", "exec -it abc123"},   // same env as zdocker
+		{"lab", "tcp://10.0.0.5:2376", "--context lab exec -it abc123"}, // same context
+		{"", "tcp://127.0.0.1:2375", "-H tcp://127.0.0.1:2375 exec -it abc123"},
+	}
+	for _, tt := range tests {
+		got := strings.Join(execArgs(tt.ctx, tt.host, c), " ")
+		if !strings.HasPrefix(got, tt.wantPrefix) || !strings.HasSuffix(got, "sh -c "+shellScript) {
+			t.Errorf("ctx=%q host=%q: %q", tt.ctx, tt.host, got)
+		}
+	}
+}
+
+func TestOpenShell(t *testing.T) {
+	var ran []string
+	r := shellRunner{
+		lookPath: func(string) (string, error) { return "/usr/bin/docker", nil },
+		command: func(name string, args ...string) *exec.Cmd {
+			ran = append([]string{name}, args...)
+			return exec.Command("true")
+		},
+	}
+	running := docker.Container{ID: "abc", Name: "web", State: "running"}
+
+	if cmd := r.openShell("lab", "", running); cmd == nil {
+		t.Fatal("expected an exec command")
+	}
+	if strings.Join(ran, " ") != "/usr/bin/docker --context lab exec -it abc sh -c "+shellScript {
+		t.Fatalf("command = %q", ran)
+	}
+
+	stopped := docker.Container{Name: "api", State: "exited"}
+	if msg := r.openShell("lab", "", stopped)(); !strings.Contains(fmt.Sprint(msg), "needs a running container") {
+		t.Fatalf("stopped container: %v", msg)
+	}
+
+	noCLI := shellRunner{lookPath: func(string) (string, error) { return "", errors.New("not found") }, command: r.command}
+	if msg := noCLI.openShell("lab", "", running)(); !strings.Contains(fmt.Sprint(msg), "needs the docker CLI") {
+		t.Fatalf("no docker CLI: %v", msg)
+	}
+}
+
+func TestShellReadOnlyAndExit(t *testing.T) {
+	f := newFake()
+	m := startModelWith(t, docker.ReadOnly(f), Options{ReadOnly: true})
+	m = send(t, m, press("j"))
+	m = send(t, m, press("e"))
+	if !strings.Contains(m.status, "--read-only") {
+		t.Fatalf("status = %q", m.status)
+	}
+
+	m = startModel(t, newFake())
+	m = send(t, m, shellExitedMsg{name: "web"})
+	if m.status != "left the shell in web" {
+		t.Fatalf("status = %q", m.status)
+	}
+	m = send(t, m, shellExitedMsg{name: "web", err: errors.New("exit status 127")})
+	if !m.statusIsErr || !strings.Contains(m.status, "shell in web: exit status 127") {
+		t.Fatalf("status = %q", m.status)
 	}
 }

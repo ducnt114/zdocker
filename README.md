@@ -71,6 +71,7 @@ header shows `● live` or `○ reconnecting`.
 | `R` | restart container (asks first) |
 | `D` | remove container / image / volume / network (asks first; a running container is killed) |
 | `t` | live stats (CPU, memory, network, block I/O) with sparklines |
+| `e` | shell in the container (`docker exec -it … bash`/`sh`; needs the docker CLI) |
 | `p` | (images) pull: opens `:pull repo:tag`, with progress per layer |
 | `a` | toggle all / running containers |
 | `g` | group containers by Docker Compose project (`enter` on a project folds it) |
