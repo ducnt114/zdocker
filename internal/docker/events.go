@@ -10,7 +10,7 @@ import (
 
 // Event is one change reported by the daemon, e.g. container "web" died.
 type Event struct {
-	Kind   string // "container" or "image"
+	Kind   string // "container", "image", "volume" or "network"
 	Action string // start, die, destroy, pull, delete, …
 	ID     string
 	Name   string // container name or image reference, when known
@@ -28,7 +28,9 @@ func (c *client) Events(ctx context.Context) (<-chan Event, <-chan error) {
 	out := make(chan Event, 64)
 	errs := make(chan error, 1)
 
-	filters := mobyclient.Filters{}.Add("type", string(events.ContainerEventType), string(events.ImageEventType))
+	filters := mobyclient.Filters{}.Add("type",
+		string(events.ContainerEventType), string(events.ImageEventType),
+		string(events.VolumeEventType), string(events.NetworkEventType))
 	res := c.api.Events(ctx, mobyclient.EventsListOptions{Filters: filters})
 
 	go func() {

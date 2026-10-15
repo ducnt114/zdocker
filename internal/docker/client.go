@@ -23,6 +23,11 @@ type Client interface {
 	// containers using each image.
 	ListImages(ctx context.Context) ([]Image, error)
 
+	// ListVolumes and ListNetworks return one row each, with the number of
+	// containers using it.
+	ListVolumes(ctx context.Context) ([]Volume, error)
+	ListNetworks(ctx context.Context) ([]Network, error)
+
 	// ContainerLogs follows a container's logs until ctx is cancelled,
 	// with stdout and stderr told apart.
 	ContainerLogs(ctx context.Context, id string, o LogOptions) (<-chan LogLine, <-chan error, error)
@@ -49,6 +54,8 @@ type Client interface {
 	RemoveContainer(ctx context.Context, id string, force bool) error
 	// RemoveImage removes a "repo:tag" (untag) or an image ID.
 	RemoveImage(ctx context.Context, ref string, force bool) error
+	RemoveVolume(ctx context.Context, name string, force bool) error
+	RemoveNetwork(ctx context.Context, id string) error
 }
 
 // ServerInfo describes the daemon zdocker talks to.

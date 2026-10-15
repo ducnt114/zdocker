@@ -16,6 +16,10 @@ zdocker là "anh em" của [kboba](https://github.com/ducnt114/kboba): cùng ki�
 8. [Phase (g): Stats](#8-phase-g-stats)
 9. [Tổng kết MVP và Phase 2](#9-tổng-kết-mvp-và-phase-2)
 
+**Phase 2**
+
+10. [Phase 2.1: Volumes và Networks](#10-phase-21-volumes-và-networks)
+
 ---
 
 ## 1. Bức tranh tổng thể
@@ -412,15 +416,79 @@ MVP gồm 7 phase, mỗi phase một commit: kết nối + bảng containers (a)
 
 So với kboba, zdocker cho thấy cùng một kiến trúc Bubble Tea áp vào một API rất khác: không có informer → events + list lại có debounce; có thao tác ghi → mô tả ở view, thực hiện ở root, xác nhận chỉ bằng `y`, chặn thật ở client; stream log ghép kênh → `stdcopy` + writer giữ thứ tự; stats luỹ kế → tính chênh lệch. Và một cách test mới: fake daemon bằng `httptest` cho phép chạy **client Moby thật** mà không cần Docker.
 
-### Phase 2 (đã thống nhất để sau)
+### Phase 2
 
-| Tính năng | Học được gì |
+| Phase | Tính năng | Học được gì | Trạng thái |
+|---|---|---|---|
+| 2.1 | Volumes, Networks | View generic `listView[T]`, message generic | ✅ [mục 10](#10-phase-21-volumes-và-networks) |
+| 2.2 | Nhóm theo Docker Compose project | Nhóm/gập dòng trong bảng, label `com.docker.compose.*` | ⏳ |
+| 2.3 | Chọn docker context (`:ctx`) | Đọc `~/.docker/contexts`, tạo lại client như kboba đổi kube context | ⏳ |
+| 2.4 | `pull` image (có tiến trình) | Stream JSON tiến trình của từng layer, progress bar | ⏳ |
+| 2.5 | `prune` (containers đã dừng, images dangling) | Thao tác hàng loạt, xác nhận kèm con số sẽ bị xoá | ⏳ |
+| 2.6 | `exec` vào shell của container | `tea.ExecProcess`: tạm nhường terminal cho `docker exec -it` rồi quay lại TUI | ⏳ |
+| 2.7 | Cột CPU/MEM ngay trong bảng containers | Nhiều stream stats song song hoặc lấy mẫu một lần có giới hạn | ⏳ |
+
+---
+
+# Phase 2
+
+## 10. Phase 2.1: Volumes và Networks
+
+### Mục tiêu
+`:volumes` (`:vol`, `:v`) và `:networks` (`:net`, `:n`): bảng có filter/sort, cột IN USE (bao nhiêu container dùng), `i` inspect, `D` xoá có xác nhận, cập nhật theo events. Volume/network không ai dùng có màu mờ (ứng viên cho prune); tiêu đề volumes đếm số không dùng.
+
+### Học được gì
+- **Generics cho view**: volumes và networks giống nhau về mọi mặt trừ *kiểu dữ liệu* và *cách dựng dòng*. Thay vì chép `imagesView` hai lần, một `listView[T]` nhận một `listSpec[T]` (title, load, key, row, columns, inspect, remove).
+- **Message generic trong type switch**: `listLoadedMsg[docker.Volume]` và `listLoadedMsg[docker.Network]` là **hai kiểu khác nhau** — `case listLoadedMsg[docker.Volume]:` trong root định tuyến đúng view mà không cần thêm trường "loại".
+- **"Đang được dùng" lại là một phép ghép**: daemon không cho biết volume nào đang được mount hay network nào có container — đếm từ `ContainerList(all)`: `Mounts` có `Type == volume` (một bind mount trùng tên không tính), `NetworkSettings.Networks[*].NetworkID`.
+- **Event nào ảnh hưởng gì** mở rộng thêm: event `volume`/`network` → list lại bảng tương ứng; container `create`/`destroy` → list lại images, volumes **và** networks (IN USE của cả ba đổi).
+- **Từ chối sớm ở UI những gì chắc chắn thất bại**: `bridge`, `host`, `none` là network dựng sẵn → báo lỗi ngay, không hỏi xác nhận. Những gì *có thể* thất bại (xoá volume đang dùng) thì vẫn hỏi, kèm cảnh báo, và để daemon quyết định.
+- **Xoá volume là mất dữ liệu**: câu hỏi xác nhận nói thẳng "and ALL its data".
+
+### Thể hiện trong code
+
+**`internal/docker`**:
+- `volumes.go`: `ListVolumes` (`VolumeList` + đếm mount loại volume; `CreatedAt` là chuỗi RFC3339 → `time.Parse`, lỗi thì để zero và UI hiện `-`), `RemoveVolume(name, force)`.
+- `networks.go`: `ListNetworks` (`NetworkList` + đếm theo `NetworkID`; subnet đầu tiên của IPAM là `netip.Prefix`; `BuiltIn` cho bridge/host/none), `RemoveNetwork(id)`.
+- `allContainers` dùng chung cho các phép đếm.
+- `Inspect` thêm `KindVolume`, `KindNetwork` (cả hai có `Raw`).
+- Events: filter thêm `volume`, `network`.
+- `RemoveVolume`, `RemoveNetwork` được thêm vào `writeMethods` và `ReadOnly` — test phân loại ở phase (f) sẽ fail nếu quên.
+
+**`internal/ui/listview.go`**:
+
+```go
+type listSpec[T any] struct {
+    title   string
+    load    func(ctx context.Context, c docker.Client) ([]T, error)
+    key     func(T) string
+    row     func(item T, now time.Time) tableRow
+    columns func(width int) []tableColumn
+    note    func(items []T) string
+    inspect func(T) openInspectMsg
+    remove  func(T) (actionMsg, error)   // error = từ chối trước khi hỏi
+}
+type listView[T any] struct { spec listSpec[T]; table filterTable; items map[string]T; … }
+```
+
+`listView[T]` làm toàn bộ phần chung: load có `gen`, `filterTable`, `i`, `D`, `r`, help. `volnet.go` chỉ chứa hai giá trị `volumesSpec`, `networksSpec` — thuần dữ liệu và closure.
+
+**Root**: `volumes listView[docker.Volume]`, `networks listView[docker.Network]`, `case listLoadedMsg[docker.Volume]` / `[docker.Network]`, `reloadMsg{containers, images, volumes, networks}`, load cả bốn danh sách khi kết nối.
+
+**Fake daemon chạy được**: 3 volume (2 của project `shop`, 1 vô danh không dùng), 5 network (3 dựng sẵn, `shop_default`, `old_test_net`), container mẫu được gắn mount và network; `DELETE` từ chối volume đang dùng (409) và network dựng sẵn/có endpoint (403), phát event `destroy`.
+
+### Test liên quan
+- `internal/docker/volumes_networks_test.go`: `TestListVolumes` (bind mount trùng tên không tính, project, CreatedAt), `TestListNetworks` (đếm theo NetworkID, built-in, subnet, container không có network settings), `TestRemoveVolumeAndNetwork`, `TestInspectVolumeAndNetwork`.
+- `internal/ui/root_test.go`: `TestVolumesView` (cột, "1 unused", xác nhận "ALL its data", cảnh báo in-use, inspect, Esc về volumes), `TestNetworksView` (network dựng sẵn bị từ chối không hỏi, xoá network thường), `TestVolumeAndNetworkEventsReload`.
+- Thủ công: `:vol`, `:net` trên fake daemon; xoá `old_test_net` → event → bảng còn 4 network.
+
+### Bẫy
+| Bẫy | Cách xử lý |
 |---|---|
-| Volumes, Networks | Thêm view trên cùng khuôn `filterTable` |
-| Nhóm theo Docker Compose project | Nhóm/gập dòng trong bảng, label `com.docker.compose.*` |
-| Chọn docker context (`:ctx`) | Đọc `~/.docker/contexts`, tạo lại client như kboba đổi kube context |
-| `pull` image (có tiến trình) | Stream JSON tiến trình của từng layer, progress bar |
-| `prune` (containers đã dừng, images không dùng) | Thao tác hàng loạt, xác nhận kèm con số sẽ bị xoá |
-| `exec` vào shell của container | `tea.ExecProcess`: tạm nhường terminal cho `docker exec -it` rồi quay lại TUI |
-| Cột CPU/MEM ngay trong bảng containers | Nhiều stream stats song song hoặc lấy mẫu một lần có giới hạn |
+| Hai view gần như giống hệt → hai bản code | `listView[T]` + `listSpec[T]` |
+| Phân biệt message của hai view cùng khuôn | Message generic: mỗi `T` là một kiểu riêng |
+| Đếm nhầm bind mount trùng tên volume | Chỉ đếm `mount.TypeVolume` |
+| Đếm network theo tên (có thể trùng/đổi) | Đếm theo `NetworkID` |
+| Hỏi xác nhận cho thao tác chắc chắn bị từ chối | `remove` trả lỗi trước khi hỏi (network dựng sẵn) |
+| Fixture test không sắp xếp như client thật | Fixture theo đúng thứ tự client trả về |
 

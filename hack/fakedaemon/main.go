@@ -16,6 +16,7 @@ import (
 	"log"
 	"math"
 	"net/http"
+	"net/netip"
 	"regexp"
 	"slices"
 	"strings"
@@ -25,12 +26,18 @@ import (
 	"github.com/moby/moby/api/types/container"
 	"github.com/moby/moby/api/types/events"
 	"github.com/moby/moby/api/types/image"
+	"github.com/moby/moby/api/types/mount"
+	"github.com/moby/moby/api/types/network"
+	"github.com/moby/moby/api/types/volume"
 )
 
 var versionPrefix = regexp.MustCompile(`^/v[0-9]+\.[0-9]+`)
 
 // Image IDs shared by the sample images and containers.
 const (
+	bridgeNetID = "bridge00000000000000aaaa"
+	shopNetID   = "a7f3c2e1d0b9a8f7e6d5c4b3"
+
 	nginxID   = "sha256:6e5f0b6bd4f2f1d7a3b0e3c09c8f8a5d0b3c6d9e1f2a3b4c5d6e7f8091a2b3c4"
 	apiID     = "sha256:a1b2c3d4e5f60718293a4b5c6d7e8f901a2b3c4d5e6f708192a3b4c5d6e7f809"
 	workerID  = "sha256:b2c3d4e5f60718293a4b5c6d7e8f901a2b3c4d5e6f708192a3b4c5d6e7f8091a"
@@ -42,12 +49,31 @@ type daemon struct {
 	mu          sync.Mutex
 	containers  []container.Summary
 	images      []image.Summary
+	volumes     []volume.Volume
+	networks    []network.Summary
 	subscribers map[chan events.Message]bool // /events streams
 }
 
 func newDaemon() *daemon {
 	now := time.Now()
-	return &daemon{subscribers: map[chan events.Message]bool{}, images: []image.Summary{
+	shopNet := map[string]*network.EndpointSettings{"shop_default": {NetworkID: shopNetID}}
+	d := &daemon{subscribers: map[chan events.Message]bool{}, volumes: []volume.Volume{
+		{Name: "shop_db", Driver: "local", CreatedAt: now.Add(-3 * time.Hour).UTC().Format(time.RFC3339),
+			Mountpoint: "/var/lib/docker/volumes/shop_db/_data", Labels: map[string]string{"com.docker.compose.project": "shop"}},
+		{Name: "shop_cache", Driver: "local", CreatedAt: now.Add(-3 * time.Hour).UTC().Format(time.RFC3339),
+			Mountpoint: "/var/lib/docker/volumes/shop_cache/_data", Labels: map[string]string{"com.docker.compose.project": "shop"}},
+		{Name: "3f1c9a7e2b4d", Driver: "local", CreatedAt: now.Add(-40 * 24 * time.Hour).UTC().Format(time.RFC3339),
+			Mountpoint: "/var/lib/docker/volumes/3f1c9a7e2b4d/_data"}, // anonymous, unused
+	}, networks: []network.Summary{
+		{Network: network.Network{ID: bridgeNetID, Name: "bridge", Driver: "bridge", Scope: "local", Created: now.Add(-60 * 24 * time.Hour),
+			IPAM: network.IPAM{Config: []network.IPAMConfig{{Subnet: netip.MustParsePrefix("172.17.0.0/16")}}}}},
+		{Network: network.Network{ID: "host0000000000000000", Name: "host", Driver: "host", Scope: "local", Created: now.Add(-60 * 24 * time.Hour)}},
+		{Network: network.Network{ID: "none0000000000000000", Name: "none", Driver: "null", Scope: "local", Created: now.Add(-60 * 24 * time.Hour)}},
+		{Network: network.Network{ID: shopNetID, Name: "shop_default", Driver: "bridge", Scope: "local", Created: now.Add(-3 * time.Hour),
+			Labels: map[string]string{"com.docker.compose.project": "shop"},
+			IPAM:   network.IPAM{Config: []network.IPAMConfig{{Subnet: netip.MustParsePrefix("172.18.0.0/16")}}}}},
+		{Network: network.Network{ID: "oldnet00000000000000", Name: "old_test_net", Driver: "bridge", Scope: "local", Created: now.Add(-20 * 24 * time.Hour)}},
+	}, images: []image.Summary{
 		{ID: nginxID, RepoTags: []string{"nginx:1.27", "nginx:latest"}, Size: 192_400_000, Created: now.Add(-21 * 24 * time.Hour).Unix()},
 		{ID: apiID, RepoTags: []string{"shop/api:dev"}, Size: 48_200_000, Created: now.Add(-3 * time.Hour).Unix()},
 		{ID: workerID, RepoTags: []string{"shop/worker:dev"}, Size: 51_700_000, Created: now.Add(-3 * time.Hour).Unix()},
@@ -68,6 +94,22 @@ func newDaemon() *daemon {
 		{ID: "c0ffee000005aaaaaaaaaaaaaaaaaaaa", Names: []string{"/flaky"}, ImageID: busyboxID, Image: "busybox:1.36",
 			State: container.StateExited, Status: "Exited (137) 3 minutes ago", Created: now.Add(-time.Hour).Unix()},
 	}}
+	// Wire the sample containers to volumes and networks.
+	for i := range d.containers {
+		c := &d.containers[i]
+		c.NetworkSettings = &container.NetworkSettingsSummary{Networks: map[string]*network.EndpointSettings{"bridge": {NetworkID: bridgeNetID}}}
+		switch c.Names[0] {
+		case "/api", "/web", "/worker", "/migrate":
+			c.NetworkSettings.Networks = shopNet
+		}
+		switch c.Names[0] {
+		case "/api", "/migrate":
+			c.Mounts = []container.MountPoint{{Type: mount.TypeVolume, Name: "shop_db"}}
+		case "/worker":
+			c.Mounts = []container.MountPoint{{Type: mount.TypeVolume, Name: "shop_cache"}}
+		}
+	}
+	return d
 }
 
 func (d *daemon) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -84,6 +126,14 @@ func (d *daemon) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	if r.Method == "DELETE" && strings.HasPrefix(path, "/images/") {
 		d.removeImage(w, r, strings.TrimPrefix(path, "/images/"))
+		return
+	}
+	if name, ok := strings.CutPrefix(path, "/volumes/"); ok {
+		d.volumeEndpoint(w, r, name)
+		return
+	}
+	if id, ok := strings.CutPrefix(path, "/networks/"); ok {
+		d.networkEndpoint(w, r, id)
 		return
 	}
 	if r.Method == "DELETE" && strings.HasPrefix(path, "/containers/") {
@@ -105,6 +155,14 @@ func (d *daemon) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case "GET /images/json":
 		d.mu.Lock()
 		writeJSON(w, d.images)
+		d.mu.Unlock()
+	case "GET /volumes":
+		d.mu.Lock()
+		writeJSON(w, map[string]any{"Volumes": d.volumes})
+		d.mu.Unlock()
+	case "GET /networks":
+		d.mu.Lock()
+		writeJSON(w, d.networks)
 		d.mu.Unlock()
 	default:
 		jsonError(w, `{"message":"fakedaemon: not implemented"}`, http.StatusNotFound)
@@ -245,6 +303,77 @@ func (d *daemon) removeImage(w http.ResponseWriter, r *http.Request, ref string)
 		return
 	}
 	jsonError(w, `{"message":"No such image: `+ref+`"}`, http.StatusNotFound)
+}
+
+func (d *daemon) volumeEndpoint(w http.ResponseWriter, r *http.Request, name string) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	i := slices.IndexFunc(d.volumes, func(v volume.Volume) bool { return v.Name == name })
+	if i < 0 {
+		jsonError(w, `{"message":"get `+name+`: no such volume"}`, http.StatusNotFound)
+		return
+	}
+	switch r.Method {
+	case "GET":
+		writeJSON(w, d.volumes[i])
+	case "DELETE":
+		for _, c := range d.containers {
+			for _, m := range c.Mounts {
+				if m.Name == name && r.URL.Query().Get("force") != "true" {
+					jsonError(w, `{"message":"remove `+name+`: volume is in use - [`+c.ID[:12]+`]"}`, http.StatusConflict)
+					return
+				}
+			}
+		}
+		d.volumes = slices.Delete(d.volumes, i, i+1)
+		d.publishOther(events.VolumeEventType, name, name, events.ActionDestroy)
+		w.WriteHeader(http.StatusNoContent)
+	}
+}
+
+func (d *daemon) networkEndpoint(w http.ResponseWriter, r *http.Request, id string) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	i := slices.IndexFunc(d.networks, func(n network.Summary) bool { return n.ID == id || n.Name == id })
+	if i < 0 {
+		jsonError(w, `{"message":"network `+id+` not found"}`, http.StatusNotFound)
+		return
+	}
+	n := d.networks[i]
+	switch r.Method {
+	case "GET":
+		writeJSON(w, n)
+	case "DELETE":
+		if n.Name == "bridge" || n.Name == "host" || n.Name == "none" {
+			jsonError(w, `{"message":"`+n.Name+` is a pre-defined network and cannot be removed"}`, http.StatusForbidden)
+			return
+		}
+		for _, c := range d.containers {
+			if c.NetworkSettings != nil {
+				for _, ep := range c.NetworkSettings.Networks {
+					if ep.NetworkID == n.ID {
+						jsonError(w, `{"message":"error while removing network: network `+n.Name+` id `+n.ID+` has active endpoints"}`, http.StatusForbidden)
+						return
+					}
+				}
+			}
+		}
+		d.networks = slices.Delete(d.networks, i, i+1)
+		d.publishOther(events.NetworkEventType, n.ID, n.Name, events.ActionDestroy)
+		w.WriteHeader(http.StatusNoContent)
+	}
+}
+
+// publishOther emits a volume or network event; d.mu must be held.
+func (d *daemon) publishOther(typ events.Type, id, name string, action events.Action) {
+	m := events.Message{Type: typ, Action: action, TimeNano: time.Now().UnixNano(),
+		Actor: events.Actor{ID: id, Attributes: map[string]string{"name": name}}}
+	for ch := range d.subscribers {
+		select {
+		case ch <- m:
+		default:
+		}
+	}
 }
 
 func (d *daemon) publishImage(id, name string, action events.Action) {

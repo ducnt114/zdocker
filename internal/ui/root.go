@@ -27,6 +27,8 @@ const (
 	viewLogs
 	viewInspect
 	viewStats
+	viewVolumes
+	viewNetworks
 )
 
 // connectedMsg reports the result of the initial Ping.
@@ -59,6 +61,8 @@ type Model struct {
 	logs       logsView
 	inspect    inspectView
 	stats      statsView
+	volumes    listView[docker.Volume]
+	networks   listView[docker.Network]
 	// returnTo is the table logs/inspect go back to.
 	returnTo viewID
 
@@ -77,7 +81,7 @@ type Model struct {
 func New(c docker.Client, opts Options) Model {
 	ti := textinput.New()
 	ti.Prompt = ":"
-	ti.Placeholder = "containers | images | quit"
+	ti.Placeholder = "containers | images | volumes | networks | quit"
 
 	return Model{
 		client:     c,
@@ -89,6 +93,8 @@ func New(c docker.Client, opts Options) Model {
 		logs:       newLogsView(),
 		inspect:    newInspectView(),
 		stats:      newStatsView(),
+		volumes:    newListView(c, volumesSpec),
+		networks:   newListView(c, networksSpec),
 		command:    ti,
 		help:       help.New(),
 		status:     "connecting…",
@@ -133,7 +139,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.server = msg.info
 		m.status, m.statusIsErr = fmt.Sprintf("connected to %s (API %s)", msg.info.Host, msg.info.APIVersion), false
 		// List once, then follow events and re-list what changes.
-		return m, tea.Batch(m.containers.load(), m.images.load(), m.events.start())
+		return m, tea.Batch(m.containers.load(), m.images.load(), m.volumes.load(), m.networks.load(), m.events.start())
 
 	case eventsStartedMsg, dockerEventsMsg, eventsEndedMsg, debounceMsg, reconnectMsg:
 		var cmd tea.Cmd
@@ -201,6 +207,12 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.images {
 			cmds = append(cmds, m.images.load())
 		}
+		if msg.volumes {
+			cmds = append(cmds, m.volumes.load())
+		}
+		if msg.networks {
+			cmds = append(cmds, m.networks.load())
+		}
 		return m, tea.Batch(cmds...)
 
 	// Messages of the containers view, whatever view is active.
@@ -220,10 +232,22 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.images, cmd = m.images.Update(msg)
 		return m, cmd
 
+	case listLoadedMsg[docker.Volume]:
+		var cmd tea.Cmd
+		m.volumes, cmd = m.volumes.Update(msg)
+		return m, cmd
+
+	case listLoadedMsg[docker.Network]:
+		var cmd tea.Cmd
+		m.networks, cmd = m.networks.Update(msg)
+		return m, cmd
+
 	case ageTickMsg:
 		var cmd tea.Cmd
 		m.containers, cmd = m.containers.Update(msg)
 		m.images, _ = m.images.Update(msg)
+		m.volumes, _ = m.volumes.Update(msg)
+		m.networks, _ = m.networks.Update(msg)
 		return m, cmd
 	}
 	return m.updateActive(msg)
@@ -299,6 +323,12 @@ func (m Model) runCommand(input string) (tea.Model, tea.Cmd) {
 	case "images", "image", "img", "i":
 		m.setActive(viewImages)
 		return m, nil
+	case "volumes", "volume", "vol", "v":
+		m.setActive(viewVolumes)
+		return m, nil
+	case "networks", "network", "net", "n":
+		m.setActive(viewNetworks)
+		return m, nil
 	case "q", "quit":
 		return m, tea.Quit
 	}
@@ -331,6 +361,10 @@ func (m Model) updateActive(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.inspect, cmd = m.inspect.Update(msg)
 	case viewStats:
 		m.stats, cmd = m.stats.Update(msg)
+	case viewVolumes:
+		m.volumes, cmd = m.volumes.Update(msg)
+	case viewNetworks:
+		m.networks, cmd = m.networks.Update(msg)
 	}
 	return m, cmd
 }
@@ -347,6 +381,10 @@ func (m Model) activeCapturingInput() bool {
 		return m.inspect.capturingInput()
 	case viewStats:
 		return m.stats.capturingInput()
+	case viewVolumes:
+		return m.volumes.capturingInput()
+	case viewNetworks:
+		return m.networks.capturingInput()
 	}
 	return false
 }
@@ -363,6 +401,10 @@ func (m Model) activeKeys() helpKeys {
 		return helpKeys{view: m.inspect.keys()}
 	case viewStats:
 		return helpKeys{view: m.stats.keys()}
+	case viewVolumes:
+		return helpKeys{view: m.volumes.keys(m.opts.ReadOnly)}
+	case viewNetworks:
+		return helpKeys{view: m.networks.keys(m.opts.ReadOnly)}
 	}
 	return helpKeys{}
 }
@@ -379,6 +421,8 @@ func (m *Model) layout() {
 	m.logs.SetSize(m.width, m.bodyHeight)
 	m.inspect.SetSize(m.width, m.bodyHeight)
 	m.stats.SetSize(m.width, m.bodyHeight)
+	m.volumes.SetSize(m.width, m.bodyHeight)
+	m.networks.SetSize(m.width, m.bodyHeight)
 }
 
 func (m Model) View() string {
@@ -397,6 +441,10 @@ func (m Model) View() string {
 		body = m.inspect.View()
 	case viewStats:
 		body = m.stats.View()
+	case viewVolumes:
+		body = m.volumes.View()
+	case viewNetworks:
+		body = m.networks.View()
 	}
 	// Pin the body height so the status and help bars stay at the bottom.
 	body = lipgloss.NewStyle().Height(m.bodyHeight).MaxHeight(m.bodyHeight).Render(body)

@@ -24,3 +24,5 @@ func (readOnly) StopContainer(context.Context, string) error         { return Er
 func (readOnly) RestartContainer(context.Context, string) error      { return ErrReadOnly }
 func (readOnly) RemoveContainer(context.Context, string, bool) error { return ErrReadOnly }
 func (readOnly) RemoveImage(context.Context, string, bool) error     { return ErrReadOnly }
+func (readOnly) RemoveVolume(context.Context, string, bool) error    { return ErrReadOnly }
+func (readOnly) RemoveNetwork(context.Context, string) error         { return ErrReadOnly }

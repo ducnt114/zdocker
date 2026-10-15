@@ -14,8 +14,8 @@ import (
 // method to Client without listing it here fails the test below — on
 // purpose: a write method must also be blocked by ReadOnly.
 var (
-	readMethods  = []string{"Ping", "ListContainers", "ListImages", "ContainerLogs", "ContainerStats", "Inspect", "Events"}
-	writeMethods = []string{"StartContainer", "StopContainer", "RestartContainer", "RemoveContainer", "RemoveImage"}
+	readMethods  = []string{"Ping", "ListContainers", "ListImages", "ListVolumes", "ListNetworks", "ContainerLogs", "ContainerStats", "Inspect", "Events"}
+	writeMethods = []string{"StartContainer", "StopContainer", "RestartContainer", "RemoveContainer", "RemoveImage", "RemoveVolume", "RemoveNetwork"}
 )
 
 func TestEveryMethodIsClassified(t *testing.T) {

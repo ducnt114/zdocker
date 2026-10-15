@@ -15,6 +15,8 @@ type Kind string
 const (
 	KindContainer Kind = "container"
 	KindImage     Kind = "image"
+	KindVolume    Kind = "volume"
+	KindNetwork   Kind = "network"
 )
 
 // Inspect returns the daemon's full description of a container or image
@@ -38,6 +40,18 @@ func (c *client) Inspect(ctx context.Context, kind Kind, id string) (string, err
 			return "", err
 		}
 		raw = buf.Bytes()
+	case KindVolume:
+		res, err := c.api.VolumeInspect(ctx, id, mobyclient.VolumeInspectOptions{})
+		if err != nil {
+			return "", err
+		}
+		raw = res.Raw
+	case KindNetwork:
+		res, err := c.api.NetworkInspect(ctx, id, mobyclient.NetworkInspectOptions{})
+		if err != nil {
+			return "", err
+		}
+		raw = res.Raw
 	default:
 		return "", fmt.Errorf("cannot inspect a %q", kind)
 	}

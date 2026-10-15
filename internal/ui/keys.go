@@ -36,6 +36,8 @@ func (h helpKeys) FullHelp() [][]key.Binding {
 		{
 			key.NewBinding(key.WithKeys(":containers"), key.WithHelp(":containers", "containers (:ps)")),
 			key.NewBinding(key.WithKeys(":images"), key.WithHelp(":images", "images (:img)")),
+			key.NewBinding(key.WithKeys(":volumes"), key.WithHelp(":volumes", "volumes (:vol)")),
+			key.NewBinding(key.WithKeys(":networks"), key.WithHelp(":networks", "networks (:net)")),
 			key.NewBinding(key.WithKeys(":q"), key.WithHelp(":q", "quit")),
 		},
 	}

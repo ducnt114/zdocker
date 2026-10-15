@@ -46,7 +46,7 @@ type (
 	debounceMsg  struct{ gen int }
 	reconnectMsg struct{ gen int }
 	// reloadMsg asks the root model to re-list what changed.
-	reloadMsg struct{ containers, images bool }
+	reloadMsg struct{ containers, images, volumes, networks bool }
 )
 
 // eventsWatcher follows the daemon's /events stream and turns it into
@@ -63,9 +63,9 @@ type eventsWatcher struct {
 
 	// Kinds changed since the last reload, and whether a debounce timer
 	// is already running.
-	dirtyContainers, dirtyImages bool
-	debouncing                   bool
-	last                         string // last event, for the header
+	dirtyContainers, dirtyImages, dirtyVolumes, dirtyNetworks bool
+	debouncing                                                bool
+	last                                                      string // last event, for the header
 }
 
 // start (re)subscribes to events, cancelling any previous stream.
@@ -132,13 +132,17 @@ func (w eventsWatcher) Update(msg tea.Msg) (eventsWatcher, tea.Cmd) {
 			switch ev.Kind {
 			case "container":
 				w.dirtyContainers = true
-				// Creating or removing a container changes the images'
-				// "in use" count.
+				// Creating or removing a container changes the "in use"
+				// counts of images, volumes and networks.
 				if ev.Action == "create" || ev.Action == "destroy" {
-					w.dirtyImages = true
+					w.dirtyImages, w.dirtyVolumes, w.dirtyNetworks = true, true, true
 				}
 			case "image":
 				w.dirtyImages = true
+			case "volume":
+				w.dirtyVolumes = true
+			case "network":
+				w.dirtyNetworks = true
 			}
 			w.last = describeEvent(ev)
 		}
@@ -155,8 +159,8 @@ func (w eventsWatcher) Update(msg tea.Msg) (eventsWatcher, tea.Cmd) {
 			return w, nil
 		}
 		w.debouncing = false
-		reload := reloadMsg{containers: w.dirtyContainers, images: w.dirtyImages}
-		w.dirtyContainers, w.dirtyImages = false, false
+		reload := reloadMsg{containers: w.dirtyContainers, images: w.dirtyImages, volumes: w.dirtyVolumes, networks: w.dirtyNetworks}
+		w.dirtyContainers, w.dirtyImages, w.dirtyVolumes, w.dirtyNetworks = false, false, false, false
 		return w, func() tea.Msg { return reload }
 
 	case eventsEndedMsg:
@@ -183,7 +187,7 @@ func (w eventsWatcher) Update(msg tea.Msg) (eventsWatcher, tea.Cmd) {
 			return w, nil
 		}
 		// Events missed while disconnected are lost: re-list everything.
-		return w, tea.Batch(w.start(), func() tea.Msg { return reloadMsg{containers: true, images: true} })
+		return w, tea.Batch(w.start(), func() tea.Msg { return reloadMsg{true, true, true, true} })
 	}
 	return w, nil
 }

@@ -28,6 +28,11 @@ type fakeClient struct {
 	writes     []string
 	writeErr   error
 	statsCalls []context.Context
+
+	volumes      []docker.Volume
+	networks     []docker.Network
+	volumeCalls  int
+	networkCalls int
 }
 
 // ContainerLogs emits the container's canned lines and stays open (like
@@ -92,6 +97,25 @@ func (f *fakeClient) ContainerStats(ctx context.Context, id string) (<-chan dock
 	return ch, make(chan error, 1), nil
 }
 
+func (f *fakeClient) ListVolumes(context.Context) ([]docker.Volume, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.volumeCalls++
+	return f.volumes, nil
+}
+func (f *fakeClient) ListNetworks(context.Context) ([]docker.Network, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.networkCalls++
+	return f.networks, nil
+}
+func (f *fakeClient) RemoveVolume(_ context.Context, name string, force bool) error {
+	return f.record(fmt.Sprintf("rmvol %s force=%v", name, force))
+}
+func (f *fakeClient) RemoveNetwork(_ context.Context, id string) error {
+	return f.record("rmnet " + id)
+}
+
 type logCall struct {
 	id   string
 	opts docker.LogOptions
@@ -138,7 +162,14 @@ func (f *fakeClient) ListContainers(_ context.Context, all bool) ([]docker.Conta
 
 func newFake() *fakeClient {
 	now := time.Now()
-	return &fakeClient{images: []docker.Image{
+	return &fakeClient{volumes: []docker.Volume{
+		{Name: "orphan", Driver: "local"},
+		{Name: "shop_db", Driver: "local", Project: "shop", InUse: 1, Created: now.Add(-time.Hour)},
+	}, networks: []docker.Network{
+		{ID: "n-bridge", Name: "bridge", Driver: "bridge", Scope: "local", BuiltIn: true, InUse: 1},
+		{ID: "n-old", Name: "old_net", Driver: "bridge", Scope: "local"},
+		{ID: "n-shop", Name: "shop_default", Driver: "bridge", Scope: "local", Subnet: "172.18.0.0/16", InUse: 2},
+	}, images: []docker.Image{
 		{ID: "sha256:dead00000000beef", Repository: "<none>", Tag: "<none>", Size: 5_000, Created: now.Add(-48 * time.Hour)},
 		{ID: "sha256:aaaa00000000aaaa", Repository: "nginx", Tag: "1.27", Size: 187_000_000, Created: now.Add(-24 * time.Hour), Containers: 1},
 		{ID: "sha256:aaaa00000000aaaa", Repository: "nginx", Tag: "latest", Size: 187_000_000, Created: now.Add(-24 * time.Hour), Containers: 1},
@@ -745,5 +776,85 @@ func TestFormatBinary(t *testing.T) {
 		if got := formatBinary(in); got != want {
 			t.Errorf("formatBinary(%d) = %q, want %q", in, got, want)
 		}
+	}
+}
+
+func TestVolumesView(t *testing.T) {
+	f := newFake()
+	m := startModel(t, f)
+	m = typeCommand(t, m, "vol")
+	if m.active != viewVolumes {
+		t.Fatalf("active = %v", m.active)
+	}
+	rows := m.volumes.table.table.rows
+	if len(rows) != 2 || rows[0][0] != "orphan" || rows[0][3] != "-" || rows[1][2] != "shop" || rows[1][3] != "1" {
+		t.Fatalf("rows = %v", rows)
+	}
+	if !strings.Contains(m.volumes.View(), "Volumes[2]  1 unused") {
+		t.Fatalf("title: %s", m.volumes.View())
+	}
+
+	m = send(t, m, press("D"))
+	if !strings.Contains(ansi.Strip(m.View()), "Remove volume orphan and ALL its data?") {
+		t.Fatalf("prompt:\n%s", ansi.Strip(m.View()))
+	}
+	m = send(t, m, press("y"))
+	m = send(t, m, press("j"))
+	m = send(t, m, press("D"))
+	if !strings.Contains(ansi.Strip(m.View()), "used by 1 container(s)") {
+		t.Fatal("in-use warning missing")
+	}
+	m = send(t, m, press("esc"))
+	if strings.Join(f.writes, "|") != "rmvol orphan force=false" {
+		t.Fatalf("writes = %v", f.writes)
+	}
+
+	m = send(t, m, press("i"))
+	if m.active != viewInspect || !strings.Contains(ansi.Strip(m.inspect.View()), "Inspect volume shop_db") {
+		t.Fatalf("inspect: active=%v\n%s", m.active, ansi.Strip(m.inspect.View()))
+	}
+	m = send(t, m, press("esc"))
+	if m.active != viewVolumes {
+		t.Fatalf("esc should return to volumes, got %v", m.active)
+	}
+}
+
+func TestNetworksView(t *testing.T) {
+	f := newFake()
+	m := startModel(t, f)
+	m = typeCommand(t, m, "net")
+	rows := m.networks.table.table.rows
+	if len(rows) != 3 || rows[2][0] != "shop_default" || rows[2][4] != "172.18.0.0/16" || rows[2][5] != "2" {
+		t.Fatalf("rows = %v", rows)
+	}
+	// Built-in networks can't be removed: refused before asking.
+	m = send(t, m, press("D"))
+	if m.confirm != nil || !strings.Contains(m.status, "built into Docker") {
+		t.Fatalf("confirm=%v status=%q", m.confirm != nil, m.status)
+	}
+	m = send(t, m, press("j")) // old_net (the client sorts by name)
+	m = send(t, m, press("D"))
+	m = send(t, m, press("y"))
+	if strings.Join(f.writes, "|") != "rmnet n-old" {
+		t.Fatalf("writes = %v", f.writes)
+	}
+}
+
+func TestVolumeAndNetworkEventsReload(t *testing.T) {
+	f := newFake()
+	m := startModel(t, f)
+	gen := m.events.gen
+	v, n := f.volumeCalls, f.networkCalls
+
+	m = send(t, m, dockerEventsMsg{gen: gen, events: []docker.Event{{Kind: "volume", Action: "create"}}})
+	m = send(t, m, debounceMsg{gen: gen})
+	if f.volumeCalls != v+1 || f.networkCalls != n {
+		t.Fatalf("volume event: volumes %d→%d, networks %d→%d", v, f.volumeCalls, n, f.networkCalls)
+	}
+	// A new container changes everyone's "in use" count.
+	m = send(t, m, dockerEventsMsg{gen: gen, events: []docker.Event{{Kind: "container", Action: "create"}}})
+	m = send(t, m, debounceMsg{gen: gen})
+	if f.volumeCalls != v+2 || f.networkCalls != n+1 {
+		t.Fatalf("container create: volumes %d, networks %d", f.volumeCalls-v, f.networkCalls-n)
 	}
 }

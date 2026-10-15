@@ -1,7 +1,7 @@
 # zdocker
 
-A small, k9s-like terminal UI for your **local Docker** containers and
-images (with an IN USE count per image), built with [Bubble Tea](https://github.com/charmbracelet/bubbletea)
+A small, k9s-like terminal UI for your **local Docker** containers, images,
+volumes and networks (with "in use" counts), built with [Bubble Tea](https://github.com/charmbracelet/bubbletea)
 and the official [Moby client](https://pkg.go.dev/github.com/moby/moby/client).
 
 zdocker is a learning project and a sibling of
@@ -60,11 +60,11 @@ header shows `● live` or `○ reconnecting`.
 | `u` | start container |
 | `x` | stop container (asks first) |
 | `R` | restart container (asks first) |
-| `D` | remove container / image (asks first; a running container is killed) |
+| `D` | remove container / image / volume / network (asks first; a running container is killed) |
 | `t` | live stats (CPU, memory, network, block I/O) with sparklines |
 | `a` | toggle all / running containers |
 | `r` | refresh |
-| `:` | command (`:containers`/`:ps`, `:images`/`:img`, `:q`) |
+| `:` | command (`:containers`/`:ps`, `:images`/`:img`, `:volumes`/`:vol`, `:networks`/`:net`, `:q`) |
 | `?` | help |
 | `q` | quit |
 
