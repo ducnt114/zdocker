@@ -20,6 +20,9 @@ make build
 ./bin/zdocker [--host unix:///var/run/docker.sock | tcp://host:2375]
 ```
 
+`--read-only` disables every change (start, stop, restart, remove): it is
+enforced in the client, not just hidden in the UI.
+
 Without `--host`, zdocker connects like the `docker` CLI: `$DOCKER_HOST`
 (and `$DOCKER_TLS_VERIFY`, `$DOCKER_CERT_PATH`), else the local socket.
 
@@ -56,6 +59,10 @@ header shows `● live` or `○ reconnecting`.
 | `i` | inspect the selected container / image (JSON) |
 | `/` | filter (name, image, compose project / repo:tag, ID) |
 | `s`, `S` | sort by next column, reverse |
+| `u` | start container |
+| `x` | stop container (asks first) |
+| `R` | restart container (asks first) |
+| `D` | remove container / image (asks first; a running container is killed) |
 | `a` | toggle all / running containers |
 | `r` | refresh |
 | `:` | command (`:containers`/`:ps`, `:images`/`:img`, `:q`) |

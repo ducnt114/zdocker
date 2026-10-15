@@ -89,6 +89,11 @@ func (v imagesView) Update(msg tea.Msg) (imagesView, tea.Cmd) {
 				}
 				return v, nil
 			}
+			if img, ok := v.selected(); ok {
+				if a, ok := imageAction(msg, img); ok {
+					return v, request(a)
+				}
+			}
 		}
 		var cmd tea.Cmd
 		v.table, cmd = v.table.Update(msg)
@@ -157,7 +162,12 @@ func (v imagesView) View() string {
 
 func (v imagesView) capturingInput() bool { return v.table.Capturing() }
 
-func (v imagesView) keys() []key.Binding {
+func (v imagesView) keys(readOnly bool) []key.Binding {
 	k := containerKeyMap
-	return append([]key.Binding{k.Up, k.Down, inspectKey, k.Refresh}, v.table.Keys()...)
+	b := []key.Binding{k.Up, k.Down, inspectKey}
+	if !readOnly {
+		b = append(b, actionKeys.Remove)
+	}
+	b = append(b, k.Refresh)
+	return append(b, v.table.Keys()...)
 }

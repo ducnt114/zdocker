@@ -34,10 +34,21 @@ type connectedMsg struct {
 	err  error
 }
 
+// Options are startup settings, usually from flags.
+type Options struct {
+	// ReadOnly hides the write actions; the client given to New should
+	// then be docker.ReadOnly(…) so they can't run anyway.
+	ReadOnly bool
+}
+
 // Model is the root Bubble Tea model.
 type Model struct {
 	client docker.Client
 	server docker.ServerInfo
+	opts   Options
+
+	// confirm is an action waiting for y/n, shown in the status line.
+	confirm *pendingAction
 
 	events eventsWatcher
 
@@ -61,13 +72,14 @@ type Model struct {
 }
 
 // New returns the root model for a client.
-func New(c docker.Client) Model {
+func New(c docker.Client, opts Options) Model {
 	ti := textinput.New()
 	ti.Prompt = ":"
 	ti.Placeholder = "containers | images | quit"
 
 	return Model{
 		client:     c,
+		opts:       opts,
 		events:     eventsWatcher{client: c},
 		active:     viewContainers,
 		containers: newContainersView(c),
@@ -124,6 +136,22 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		var cmd tea.Cmd
 		m.events, cmd = m.events.Update(msg)
 		return m, cmd
+
+	case actionMsg:
+		if m.opts.ReadOnly {
+			return m, reportErr(docker.ErrReadOnly) // no point asking
+		}
+		if msg.prompt != "" {
+			m.confirm = &pendingAction{action: msg}
+			return m, nil
+		}
+		return m.startAction(msg)
+
+	case actionDoneMsg:
+		if msg.err != nil {
+			return m, reportErr(msg.err)
+		}
+		return m, reportInfo(msg.done)
 
 	case openLogsMsg:
 		m.returnTo = m.active
@@ -191,6 +219,17 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	if msg.Type == tea.KeyCtrlC {
 		return m, tea.Quit
 	}
+	// A pending confirmation takes the next key: y runs it, anything else
+	// cancels. Destructive actions never run on a stray key.
+	if m.confirm != nil {
+		a := m.confirm.action
+		m.confirm = nil
+		if msg.String() == "y" || msg.String() == "Y" {
+			return m.startAction(a)
+		}
+		m.status, m.statusIsErr = "cancelled", false
+		return m, nil
+	}
 	if m.commandMode {
 		switch msg.Type {
 		case tea.KeyEsc:
@@ -221,6 +260,11 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 	}
 	return m.updateActive(msg)
+}
+
+func (m Model) startAction(a actionMsg) (tea.Model, tea.Cmd) {
+	m.status, m.statusIsErr = a.progress, false
+	return m, runAction(m.client, a)
 }
 
 func (m *Model) exitCommandMode() {
@@ -289,9 +333,9 @@ func (m Model) activeCapturingInput() bool {
 func (m Model) activeKeys() helpKeys {
 	switch m.active {
 	case viewContainers:
-		return helpKeys{view: m.containers.keys()}
+		return helpKeys{view: m.containers.keys(m.opts.ReadOnly)}
 	case viewImages:
-		return helpKeys{view: m.images.keys()}
+		return helpKeys{view: m.images.keys(m.opts.ReadOnly)}
 	case viewLogs:
 		return helpKeys{view: m.logs.keys()}
 	case viewInspect:
@@ -352,12 +396,19 @@ func (m Model) headerView() string {
 	case eventsReconnecting:
 		live = reconnectingStyle.Render("○ reconnecting")
 	}
-	return lipgloss.NewStyle().MaxWidth(m.width).Render(headerStyle.Render("zdocker") + headerInfoStyle.Render(info) + live)
+	badge := ""
+	if m.opts.ReadOnly {
+		badge = readOnlyStyle.Render("read-only")
+	}
+	return lipgloss.NewStyle().MaxWidth(m.width).Render(headerStyle.Render("zdocker") + badge + headerInfoStyle.Render(info) + live)
 }
 
 func (m Model) statusView() string {
 	if m.commandMode {
 		return m.command.View()
+	}
+	if m.confirm != nil {
+		return lipgloss.NewStyle().MaxWidth(m.width).Render(m.confirm.View())
 	}
 	style := statusStyle
 	if m.statusIsErr {

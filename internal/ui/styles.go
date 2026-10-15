@@ -21,6 +21,9 @@ var (
 
 	titleStyle = lipgloss.NewStyle().Bold(true).Foreground(colorAccent)
 
+	readOnlyStyle = lipgloss.NewStyle().Bold(true).Padding(0, 1).
+			Foreground(lipgloss.Color("#000000")).Background(lipgloss.AdaptiveColor{Light: "#B58900", Dark: "#F5C542"})
+
 	liveStyle         = lipgloss.NewStyle().Foreground(lipgloss.AdaptiveColor{Light: "#2E7D32", Dark: "#5FD068"})
 	reconnectingStyle = lipgloss.NewStyle().Foreground(lipgloss.AdaptiveColor{Light: "#B58900", Dark: "#F5C542"})
 )

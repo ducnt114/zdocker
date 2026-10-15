@@ -16,6 +16,7 @@ import (
 	"log"
 	"net/http"
 	"regexp"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -80,6 +81,14 @@ func (d *daemon) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		d.inspectImage(w, strings.TrimSuffix(strings.TrimPrefix(path, "/images/"), "/json"))
 		return
 	}
+	if r.Method == "DELETE" && strings.HasPrefix(path, "/images/") {
+		d.removeImage(w, r, strings.TrimPrefix(path, "/images/"))
+		return
+	}
+	if r.Method == "DELETE" && strings.HasPrefix(path, "/containers/") {
+		d.removeContainer(w, r, strings.TrimPrefix(path, "/containers/"))
+		return
+	}
 	if id, rest, ok := strings.Cut(strings.TrimPrefix(path, "/containers/"), "/"); ok && strings.HasPrefix(path, "/containers/") && id != "json" {
 		d.containerEndpoint(w, r, id, rest)
 		return
@@ -97,7 +106,7 @@ func (d *daemon) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, d.images)
 		d.mu.Unlock()
 	default:
-		http.Error(w, `{"message":"fakedaemon: not implemented"}`, http.StatusNotFound)
+		jsonError(w, `{"message":"fakedaemon: not implemented"}`, http.StatusNotFound)
 	}
 }
 
@@ -129,7 +138,7 @@ func (d *daemon) find(ref string) (container.Summary, bool) {
 func (d *daemon) containerEndpoint(w http.ResponseWriter, r *http.Request, ref, rest string) {
 	c, ok := d.find(ref)
 	if !ok {
-		http.Error(w, `{"message":"No such container: `+ref+`"}`, http.StatusNotFound)
+		jsonError(w, `{"message":"No such container: `+ref+`"}`, http.StatusNotFound)
 		return
 	}
 	switch r.Method + " " + rest {
@@ -141,8 +150,17 @@ func (d *daemon) containerEndpoint(w http.ResponseWriter, r *http.Request, ref, 
 		})
 	case "GET logs":
 		streamLogs(w, r, c)
+	case "POST start":
+		d.setState(c.ID, container.StateRunning, "Up Less than a second", events.ActionStart)
+		w.WriteHeader(http.StatusNoContent)
+	case "POST stop":
+		d.setState(c.ID, container.StateExited, "Exited (0) Less than a second ago", events.ActionDie)
+		w.WriteHeader(http.StatusNoContent)
+	case "POST restart":
+		d.setState(c.ID, container.StateRunning, "Up Less than a second", events.ActionRestart)
+		w.WriteHeader(http.StatusNoContent)
 	default:
-		http.Error(w, `{"message":"fakedaemon: not implemented"}`, http.StatusNotFound)
+		jsonError(w, `{"message":"fakedaemon: not implemented"}`, http.StatusNotFound)
 	}
 }
 
@@ -164,7 +182,79 @@ func (d *daemon) inspectImage(w http.ResponseWriter, ref string) {
 			return
 		}
 	}
-	http.Error(w, `{"message":"No such image: `+ref+`"}`, http.StatusNotFound)
+	jsonError(w, `{"message":"No such image: `+ref+`"}`, http.StatusNotFound)
+}
+
+// setState changes a container and emits the event a daemon would.
+func (d *daemon) setState(id string, state container.ContainerState, status string, action events.Action) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	for i := range d.containers {
+		if c := &d.containers[i]; c.ID == id {
+			c.State, c.Status = state, status
+			d.publish(c.ID, strings.TrimPrefix(c.Names[0], "/"), action)
+		}
+	}
+}
+
+func (d *daemon) removeContainer(w http.ResponseWriter, r *http.Request, ref string) {
+	c, ok := d.find(ref)
+	if !ok {
+		jsonError(w, `{"message":"No such container: `+ref+`"}`, http.StatusNotFound)
+		return
+	}
+	if c.State == container.StateRunning && r.URL.Query().Get("force") != "1" {
+		jsonError(w, `{"message":"cannot remove container: container is running: stop the container before removing or force remove"}`, http.StatusConflict)
+		return
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.containers = slices.DeleteFunc(d.containers, func(x container.Summary) bool { return x.ID == c.ID })
+	d.publish(c.ID, strings.TrimPrefix(c.Names[0], "/"), events.ActionDestroy)
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// removeImage untags "repo:tag" (removing the image with its last tag) or
+// removes an image by ID, refusing images in use like the real daemon.
+func (d *daemon) removeImage(w http.ResponseWriter, r *http.Request, ref string) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	for i := range d.images {
+		img := &d.images[i]
+		byID := img.ID == ref
+		if !byID && !slices.Contains(img.RepoTags, ref) {
+			continue
+		}
+		for _, c := range d.containers {
+			if c.ImageID == img.ID && r.URL.Query().Get("force") != "1" {
+				jsonError(w, `{"message":"conflict: unable to remove repository reference \"`+ref+`\" (must force) - container `+c.ID[:12]+` is using its referenced image"}`, http.StatusConflict)
+				return
+			}
+		}
+		if !byID && len(img.RepoTags) > 1 {
+			img.RepoTags = slices.DeleteFunc(img.RepoTags, func(t string) bool { return t == ref })
+			d.publishImage(img.ID, ref, events.ActionUnTag)
+		} else {
+			d.publishImage(img.ID, ref, events.ActionDelete)
+			d.images = slices.Delete(d.images, i, i+1)
+		}
+		writeJSON(w, []map[string]string{{"Untagged": ref}})
+		return
+	}
+	jsonError(w, `{"message":"No such image: `+ref+`"}`, http.StatusNotFound)
+}
+
+func (d *daemon) publishImage(id, name string, action events.Action) {
+	m := events.Message{
+		Type: events.ImageEventType, Action: action, TimeNano: time.Now().UnixNano(),
+		Actor: events.Actor{ID: id, Attributes: map[string]string{"name": name}},
+	}
+	for ch := range d.subscribers {
+		select {
+		case ch <- m:
+		default:
+		}
+	}
 }
 
 // streamLogs writes canned logs as a multiplexed stream (8-byte frame
@@ -269,6 +359,14 @@ func (d *daemon) simulate(every time.Duration) {
 		}
 		d.mu.Unlock()
 	}
+}
+
+// jsonError answers like the daemon: a JSON body {"message": …} with a
+// JSON content type, which the client turns into a clean error message.
+func jsonError(w http.ResponseWriter, body string, code int) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(code)
+	w.Write([]byte(body))
 }
 
 func writeJSON(w http.ResponseWriter, v any) {

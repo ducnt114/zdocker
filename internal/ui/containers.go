@@ -107,6 +107,11 @@ func (v containersView) Update(msg tea.Msg) (containersView, tea.Cmd) {
 				}
 				return v, nil
 			}
+			if c, ok := v.selected(); ok {
+				if a, ok := containerAction(msg, c); ok {
+					return v, request(a)
+				}
+			}
 		}
 		var cmd tea.Cmd
 		v.table, cmd = v.table.Update(msg)
@@ -182,7 +187,13 @@ func (v containersView) View() string {
 
 func (v containersView) capturingInput() bool { return v.table.Capturing() }
 
-func (v containersView) keys() []key.Binding {
+func (v containersView) keys(readOnly bool) []key.Binding {
 	k := containerKeyMap
-	return append([]key.Binding{k.Up, k.Down, k.Logs, inspectKey, k.All, k.Refresh}, v.table.Keys()...)
+	b := []key.Binding{k.Up, k.Down, k.Logs, inspectKey}
+	if !readOnly {
+		a := actionKeys
+		b = append(b, a.Start, a.Stop, a.Restart, a.Remove)
+	}
+	b = append(b, k.All, k.Refresh)
+	return append(b, v.table.Keys()...)
 }

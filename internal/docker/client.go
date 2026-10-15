@@ -35,6 +35,16 @@ type Client interface {
 	// the stream breaks. Callers re-list on events (there is no watch with
 	// resource versions as in Kubernetes).
 	Events(ctx context.Context) (<-chan Event, <-chan error)
+
+	// Writes. ReadOnly(c) turns all of these into errors.
+
+	StartContainer(ctx context.Context, id string) error
+	// StopContainer sends SIGTERM, then SIGKILL after 10 seconds.
+	StopContainer(ctx context.Context, id string) error
+	RestartContainer(ctx context.Context, id string) error
+	RemoveContainer(ctx context.Context, id string, force bool) error
+	// RemoveImage removes a "repo:tag" (untag) or an image ID.
+	RemoveImage(ctx context.Context, ref string, force bool) error
 }
 
 // ServerInfo describes the daemon zdocker talks to.

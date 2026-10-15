@@ -15,6 +15,7 @@ import (
 
 func main() {
 	host := flag.String("host", "", "Docker daemon address (default: $DOCKER_HOST, else the local socket)")
+	readOnly := flag.Bool("read-only", false, "only look: disable start, stop, restart and remove")
 	flag.Parse()
 
 	client, err := docker.New(*host)
@@ -22,7 +23,12 @@ func main() {
 		fmt.Fprintln(os.Stderr, "zdocker:", err)
 		os.Exit(1)
 	}
-	if _, err := tea.NewProgram(ui.New(client), tea.WithAltScreen()).Run(); err != nil {
+	if *readOnly {
+		// Enforced in the client, not just hidden in the UI.
+		client = docker.ReadOnly(client)
+	}
+	model := ui.New(client, ui.Options{ReadOnly: *readOnly})
+	if _, err := tea.NewProgram(model, tea.WithAltScreen()).Run(); err != nil {
 		fmt.Fprintln(os.Stderr, "zdocker:", err)
 		os.Exit(1)
 	}

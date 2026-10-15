@@ -3,6 +3,7 @@ package ui
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"sync"
 	"testing"
@@ -24,6 +25,8 @@ type fakeClient struct {
 	images     []docker.Image
 	imageCalls int
 	logCalls   []logCall
+	writes     []string
+	writeErr   error
 }
 
 // ContainerLogs emits the container's canned lines and stays open (like
@@ -48,6 +51,27 @@ func (f *fakeClient) Inspect(_ context.Context, kind docker.Kind, id string) (st
 		return "", errors.New("No such container: gone")
 	}
 	return "{\n  \"Id\": \"" + id + "\",\n  \"Kind\": \"" + string(kind) + "\"\n}", nil
+}
+
+// Writes are recorded as "start w1", "rm w1 force=true", "rmi nginx:1.27".
+func (f *fakeClient) record(s string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.writes = append(f.writes, s)
+	return f.writeErr
+}
+func (f *fakeClient) StartContainer(_ context.Context, id string) error {
+	return f.record("start " + id)
+}
+func (f *fakeClient) StopContainer(_ context.Context, id string) error { return f.record("stop " + id) }
+func (f *fakeClient) RestartContainer(_ context.Context, id string) error {
+	return f.record("restart " + id)
+}
+func (f *fakeClient) RemoveContainer(_ context.Context, id string, force bool) error {
+	return f.record(fmt.Sprintf("rm %s force=%v", id, force))
+}
+func (f *fakeClient) RemoveImage(_ context.Context, ref string, force bool) error {
+	return f.record(fmt.Sprintf("rmi %s force=%v", ref, force))
 }
 
 type logCall struct {
@@ -108,7 +132,7 @@ func newFake() *fakeClient {
 
 func startModel(t *testing.T, c docker.Client) Model {
 	t.Helper()
-	m := New(c)
+	m := New(c, Options{})
 	m = send(t, m, tea.WindowSizeMsg{Width: 140, Height: 30})
 	for _, msg := range runCmd(m.Init()) {
 		m = send(t, m, msg)
@@ -532,5 +556,117 @@ func TestInspect(t *testing.T) {
 	m = send(t, m, inspectLoadedMsg{id: "image:sha256:other", text: "stale"})
 	if strings.Contains(ansi.Strip(m.inspect.View()), "stale") {
 		t.Fatal("stale inspect result shown")
+	}
+}
+
+func startModelWith(t *testing.T, c docker.Client, opts Options) Model {
+	t.Helper()
+	m := New(c, opts)
+	m = send(t, m, tea.WindowSizeMsg{Width: 140, Height: 30})
+	for _, msg := range runCmd(m.Init()) {
+		m = send(t, m, msg)
+	}
+	return m
+}
+
+func TestStopNeedsConfirmation(t *testing.T) {
+	f := newFake()
+	m := startModel(t, f)
+	m = send(t, m, press("j")) // web
+
+	m = send(t, m, press("x"))
+	if m.confirm == nil || !strings.Contains(ansi.Strip(m.View()), "Stop container web?") {
+		t.Fatalf("expected a confirmation:\n%s", ansi.Strip(m.View()))
+	}
+	m = send(t, m, press("n"))
+	if len(f.writes) != 0 || m.confirm != nil || m.status != "cancelled" {
+		t.Fatalf("n should cancel: writes=%v status=%q", f.writes, m.status)
+	}
+	// Any key other than y cancels — even the action key again.
+	m = send(t, m, press("x"))
+	m = send(t, m, press("x"))
+	if len(f.writes) != 0 {
+		t.Fatal("a stray key ran the action")
+	}
+
+	m = send(t, m, press("x"))
+	m = send(t, m, press("y"))
+	if len(f.writes) != 1 || f.writes[0] != "stop w1" || m.status != "web stopped" {
+		t.Fatalf("writes=%v status=%q", f.writes, m.status)
+	}
+}
+
+func TestStartNeedsNoConfirmation(t *testing.T) {
+	f := newFake()
+	m := startModel(t, f)
+	m = send(t, m, press("u")) // api (exited)
+	if m.confirm != nil || len(f.writes) != 1 || f.writes[0] != "start a1" {
+		t.Fatalf("confirm=%v writes=%v", m.confirm != nil, f.writes)
+	}
+}
+
+func TestRemoveContainerForceOnlyWhenRunning(t *testing.T) {
+	f := newFake()
+	m := startModel(t, f)
+	m = send(t, m, press("D")) // api: exited
+	if !strings.Contains(ansi.Strip(m.View()), "Remove container api?") {
+		t.Fatal("plain remove prompt expected")
+	}
+	m = send(t, m, press("y"))
+	m = send(t, m, press("j")) // web: running
+	m = send(t, m, press("D"))
+	if !strings.Contains(ansi.Strip(m.View()), "Container web is running: kill and remove it?") {
+		t.Fatalf("running remove prompt:\n%s", ansi.Strip(m.View()))
+	}
+	m = send(t, m, press("y"))
+	want := []string{"rm a1 force=false", "rm w1 force=true"}
+	if strings.Join(f.writes, "|") != strings.Join(want, "|") {
+		t.Fatalf("writes = %v", f.writes)
+	}
+}
+
+func TestRemoveImageByTagOrID(t *testing.T) {
+	f := newFake()
+	m := startModel(t, f)
+	m = typeCommand(t, m, "images") // rows: <none>, nginx:1.27, nginx:latest
+	m = send(t, m, press("D"))
+	m = send(t, m, press("y"))
+	m = send(t, m, press("j"))
+	m = send(t, m, press("D"))
+	if !strings.Contains(ansi.Strip(m.View()), "used by 1 container(s)") {
+		t.Fatalf("in-use warning missing:\n%s", ansi.Strip(m.View()))
+	}
+	m = send(t, m, press("y"))
+	want := []string{"rmi sha256:dead00000000beef force=false", "rmi nginx:1.27 force=false"}
+	if strings.Join(f.writes, "|") != strings.Join(want, "|") {
+		t.Fatalf("writes = %v", f.writes)
+	}
+}
+
+func TestActionErrorShown(t *testing.T) {
+	f := newFake()
+	f.writeErr = errors.New("conflict: unable to remove repository reference (must force)")
+	m := startModel(t, f)
+	m = typeCommand(t, m, "img")
+	m = send(t, m, press("j"))
+	m = send(t, m, press("D"))
+	m = send(t, m, press("y"))
+	if !m.statusIsErr || !strings.Contains(m.status, "must force") {
+		t.Fatalf("status = %q", m.status)
+	}
+}
+
+func TestReadOnlyMode(t *testing.T) {
+	f := newFake()
+	m := startModelWith(t, docker.ReadOnly(f), Options{ReadOnly: true})
+	if !strings.Contains(ansi.Strip(m.View()), "read-only") {
+		t.Fatal("header should show the read-only badge")
+	}
+	if strings.Contains(ansi.Strip(m.View()), "x stop") {
+		t.Fatal("write keys should be hidden in read-only mode")
+	}
+	m = send(t, m, press("x"))
+	if m.confirm != nil || !m.statusIsErr || !strings.Contains(m.status, "--read-only") || len(f.writes) != 0 {
+		t.Fatalf("confirm=%v status=%q writes=%v", m.confirm != nil, m.status, f.writes)
 	}
 }

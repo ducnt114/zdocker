@@ -12,6 +12,7 @@ zdocker là "anh em" của [kboba](https://github.com/ducnt114/kboba): cùng ki�
 4. [Phase (c): Images](#4-phase-c-images)
 5. [Phase (d): Logs](#5-phase-d-logs)
 6. [Phase (e): Inspect, filter, sort](#6-phase-e-inspect-filter-sort)
+7. [Phase (f): Thao tác, xác nhận, `--read-only`](#7-phase-f-thao-tác-xác-nhận---read-only)
 
 ---
 
@@ -304,4 +305,62 @@ sortBy: []string{3: fmt.Sprintf("%020d", img.Size), 4: …, 5: ageSortKey(img.Cr
 | Trộn đơn vị khi so sánh (`kB`/`MB`) | So số byte, không so chữ |
 | Mỗi view tự viết lại filter/sort/giữ lựa chọn | `filterTable` dùng chung |
 | Đường dẫn `/images/shop/api:dev/json` có `/` trong tham chiếu (fake daemon) | Cắt tiền tố/hậu tố thay vì tách theo `/` |
+
+## 7. Phase (f): Thao tác, xác nhận, `--read-only`
+
+### Mục tiêu
+Lần đầu tiên tool **thay đổi** thứ gì đó (khác hẳn kboba):
+
+| Phím | Container | Image | Xác nhận |
+|---|---|---|---|
+| `u` | start | | không |
+| `x` | stop (SIGTERM, sau 10s thì SIGKILL) | | có |
+| `R` | restart | | có |
+| `D` | remove (`-f` nếu đang chạy, và hỏi rõ điều đó) | remove tag / image | có |
+
+Cờ `--read-only` tắt toàn bộ thao tác ghi: header có nhãn `read-only`, các phím ghi biến khỏi help, bấm vào thì báo lỗi ngay.
+
+### Học được gì
+- **Thiết kế cho thao tác phá huỷ**: xác nhận rõ ràng *cái gì* sẽ xảy ra ("Container web is running: kill and remove it?"), chỉ `y` mới chạy — **mọi phím khác đều huỷ** (kể cả bấm lại phím vừa bấm), vì một phím lạc tay không được phép xoá thứ gì.
+- **Ngữ nghĩa `docker rmi`**: xoá theo `repo:tag` là *gỡ tag*; image chỉ biến mất khi tag cuối cùng bị gỡ. Xoá theo ID một image có nhiều tag thì daemon từ chối (trừ khi force). Image đang được container dùng → daemon từ chối (409) — zdocker cảnh báo trước trong câu hỏi xác nhận nhưng để daemon là người quyết định.
+- **Không cập nhật bảng bằng tay sau thao tác**: daemon phát event (`die`, `destroy`, `untag`…) → watcher của phase (b) list lại. Một nguồn sự thật duy nhất.
+- **Chặn ở đâu**: ẩn phím trong UI chỉ là trình bày; chặn thật nằm ở client (`docker.ReadOnly`). Và một test bằng `reflect` buộc mọi method mới phải được *phân loại* đọc/ghi.
+- **Embed interface trong struct** để làm decorator: `type readOnly struct{ Client }` tự chuyển tiếp mọi method; chỉ cần viết lại các method ghi. Mặt trái: method ghi *mới* cũng được chuyển tiếp — đó là lý do có test phân loại.
+
+### Thể hiện trong code
+
+**Client** (`internal/docker/actions.go`): `StartContainer`, `StopContainer`/`RestartContainer` (`Timeout: &10` giây — giá trị mặc định của `docker stop`, truyền tường minh), `RemoveContainer(id, force)` (không xoá volume), `RemoveImage(ref, force)`.
+
+**`ReadOnly`** (`internal/docker/readonly.go`): `readOnly{Client}` ghi đè 5 method ghi để trả `ErrReadOnly`, không gửi request nào.
+
+**Test phân loại** (`actions_test.go`):
+- `TestEveryMethodIsClassified`: duyệt method của interface `Client` bằng `reflect`; mỗi method phải nằm trong `readMethods` hoặc `writeMethods`.
+- `TestReadOnlyBlocksEveryWrite`: gọi **từng** method trong `writeMethods` qua `reflect` (context nền + giá trị zero cho các tham số khác) trên `ReadOnly(client)` → đều là `ErrReadOnly`, và fake daemon không nhận request nào.
+- `TestWriteRequests`: đúng method/endpoint/query (`POST …/stop?t=10`, `DELETE /containers/c1?force=1`, `DELETE /images/nginx:1.27`).
+
+**UI** (`internal/ui/actions.go`):
+- View *mô tả* thao tác, root *thực hiện*: `containerAction`/`imageAction` dựng một `actionMsg{prompt, progress, done, run}` (`run` là closure gọi client). Views không bao giờ tự gọi API ghi.
+- Root (`root.go`): nhận `actionMsg` → read-only thì báo lỗi luôn; có `prompt` thì lưu vào `m.confirm`; không thì `startAction`. `handleKey` xử lý `m.confirm` **trước mọi thứ**: `y`/`Y` → chạy, phím khác → "cancelled". Dòng status hiện câu hỏi (`pendingAction.View`).
+- `runAction` chạy trong Cmd với `actionTimeout` 60s (stop có thể mất 10s, xoá image lớn mất lâu hơn `requestTimeout`) → `actionDoneMsg` → "web stopped" hoặc lỗi của daemon.
+- `keys(readOnly)` của mỗi view bỏ các phím ghi khi read-only; header thêm nhãn `read-only`.
+
+**`main.go`**: `--read-only` → `client = docker.ReadOnly(client)` *và* `Options{ReadOnly: true}` — chặn ở client, ẩn ở UI.
+
+**Fake daemon chạy được**: `POST start/stop/restart` đổi trạng thái và phát event; `DELETE /containers/{id}` (409 nếu đang chạy mà không `force=1`); `DELETE /images/{ref}` gỡ tag hoặc xoá, 409 nếu image đang được dùng; lỗi trả JSON `{"message": …}` với content type JSON giống daemon thật.
+
+### Test liên quan
+- `internal/docker/actions_test.go`: ba test ở trên + `TestWriteErrorsComeFromTheDaemon` (409 "must force" truyền nguyên văn).
+- `internal/ui/root_test.go`: `TestStopNeedsConfirmation` (`n` huỷ, bấm lại `x` cũng huỷ, `y` chạy và báo "web stopped"), `TestStartNeedsNoConfirmation`, `TestRemoveContainerForceOnlyWhenRunning`, `TestRemoveImageByTagOrID` (dangling → theo ID, có tag → theo tag, cảnh báo "used by 1 container(s)"), `TestActionErrorShown`, `TestReadOnlyMode` (nhãn, phím ẩn, `x` báo lỗi không hỏi, không có write nào).
+- Thủ công với fake daemon: `x` `y` → event `die` → bảng tự cập nhật; `D` trên `nginx:1.27` → daemon từ chối với thông báo rõ; `--read-only` → nhãn và lỗi.
+
+### Bẫy
+| Bẫy | Cách xử lý |
+|---|---|
+| Phím lạc tay chạy thao tác phá huỷ | Chỉ `y` xác nhận; mọi phím khác huỷ |
+| `docker rm` container đang chạy bị từ chối | Hỏi rõ "kill and remove", rồi `force` |
+| Xoá image theo ID khi có nhiều tag | Xoá theo `repo:tag` (gỡ tag); ID chỉ cho image không tag |
+| Tự sửa bảng sau thao tác → lệch với daemon | Để event của daemon kích hoạt list lại |
+| Read-only chỉ ẩn phím ở UI | `docker.ReadOnly` chặn ở client |
+| Embed interface chuyển tiếp cả method ghi mới thêm | `TestEveryMethodIsClassified` + `TestReadOnlyBlocksEveryWrite` |
+| Lỗi hiện nguyên JSON vì fake daemon trả `text/plain` | Trả lỗi với `Content-Type: application/json` như daemon thật |
 
