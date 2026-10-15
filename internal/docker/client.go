@@ -56,6 +56,8 @@ type Client interface {
 	RemoveImage(ctx context.Context, ref string, force bool) error
 	RemoveVolume(ctx context.Context, name string, force bool) error
 	RemoveNetwork(ctx context.Context, id string) error
+	// PullImage pulls an image, streaming progress snapshots.
+	PullImage(ctx context.Context, ref string) (<-chan PullProgress, error)
 }
 
 // ServerInfo describes the daemon zdocker talks to.

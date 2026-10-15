@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"strings"
 	"sync"
 	"testing"
@@ -33,6 +34,8 @@ type fakeClient struct {
 	networks     []docker.Network
 	volumeCalls  int
 	networkCalls int
+	pulls        []pullCall
+	pullBlocks   bool
 }
 
 // ContainerLogs emits the container's canned lines and stays open (like
@@ -114,6 +117,35 @@ func (f *fakeClient) RemoveVolume(_ context.Context, name string, force bool) er
 }
 func (f *fakeClient) RemoveNetwork(_ context.Context, id string) error {
 	return f.record("rmnet " + id)
+}
+
+// PullImage sends a short, scripted pull (or a failure for "nope") and
+// records the context so tests can check cancellation.
+func (f *fakeClient) PullImage(ctx context.Context, ref string) (<-chan docker.PullProgress, error) {
+	f.mu.Lock()
+	f.pulls = append(f.pulls, pullCall{ref: ref, ctx: ctx})
+	block := f.pullBlocks
+	f.mu.Unlock()
+	ch := make(chan docker.PullProgress, 4)
+	layers := []docker.LayerProgress{{ID: "aaa", Status: "Downloading", Current: 50, Total: 100}, {ID: "bbb", Status: "Already exists"}}
+	ch <- docker.PullProgress{Ref: ref, Layers: layers, Status: "Pulling from library/" + ref}
+	if block { // a slow pull: stays open until cancelled
+		go func() { <-ctx.Done(); close(ch) }()
+		return ch, nil
+	}
+	if ref == "nope" {
+		ch <- docker.PullProgress{Ref: ref, Err: errors.New("manifest unknown")}
+	} else {
+		done := []docker.LayerProgress{{ID: "aaa", Status: "Pull complete"}, {ID: "bbb", Status: "Already exists"}}
+		ch <- docker.PullProgress{Ref: ref, Layers: done, Status: "Status: Downloaded newer image for " + ref, Done: true}
+	}
+	close(ch)
+	return ch, nil
+}
+
+type pullCall struct {
+	ref string
+	ctx context.Context
 }
 
 type logCall struct {
@@ -1038,5 +1070,103 @@ func TestSwitchContextStopsLogs(t *testing.T) {
 	m = typeCommand(t, m, "ctx colima")
 	if logCtx.Err() == nil || m.active != viewContainers {
 		t.Fatal("switching context must stop the log stream")
+	}
+}
+
+func TestPullImage(t *testing.T) {
+	f := newFake()
+	m := startModel(t, f)
+	m = typeCommand(t, m, "pull redis:7")
+	if len(f.pulls) != 1 || f.pulls[0].ref != "redis:7" {
+		t.Fatalf("pulls = %+v", f.pulls)
+	}
+	if m.active != viewPull || !m.pull.state.Done || m.status != "pulled redis:7" {
+		t.Fatalf("active=%v done=%v status=%q", m.active, m.pull.state.Done, m.status)
+	}
+	view := ansi.Strip(m.pull.View())
+	for _, want := range []string{"Pull redis:7", "done", "100%", "aaa", "Pull complete", "Downloaded newer image for redis:7"} {
+		if !strings.Contains(view, want) {
+			t.Errorf("missing %q in:\n%s", want, view)
+		}
+	}
+	m = send(t, m, press("esc"))
+	if m.active != viewImages {
+		t.Fatalf("esc should show the images, got %v", m.active)
+	}
+}
+
+func TestPullFailure(t *testing.T) {
+	m := startModel(t, newFake())
+	m = typeCommand(t, m, "pull nope")
+	if !m.statusIsErr || !strings.Contains(m.status, "manifest unknown") || !strings.Contains(ansi.Strip(m.pull.View()), "failed") {
+		t.Fatalf("status=%q view:\n%s", m.status, ansi.Strip(m.pull.View()))
+	}
+}
+
+func TestPullCancelledOnLeave(t *testing.T) {
+	f := newFake()
+	f.pullBlocks = true
+	m := startModel(t, f)
+	m = typeCommand(t, m, "pull big/image:1")
+	if !m.pull.running {
+		t.Fatal("pull should be running")
+	}
+	m = send(t, m, press("esc"))
+	if f.pulls[0].ctx.Err() == nil {
+		t.Fatal("leaving the pull view must cancel the pull")
+	}
+}
+
+func TestPullKeyPrefillsCommand(t *testing.T) {
+	m := startModel(t, newFake())
+	m = typeCommand(t, m, "img")
+	m = send(t, m, press("j")) // nginx:1.27
+	m = send(t, m, press("p"))
+	if !m.commandMode || m.command.Value() != "pull nginx:1.27" {
+		t.Fatalf("command mode=%v value=%q", m.commandMode, m.command.Value())
+	}
+}
+
+func TestPullReadOnlyAndUsage(t *testing.T) {
+	f := newFake()
+	m := startModelWith(t, docker.ReadOnly(f), Options{ReadOnly: true})
+	m = typeCommand(t, m, "pull redis")
+	if !strings.Contains(m.status, "--read-only") || len(f.pulls) != 0 {
+		t.Fatalf("status=%q pulls=%d", m.status, len(f.pulls))
+	}
+	m = typeCommand(t, m, "pull")
+	if !strings.Contains(m.status, "usage") {
+		t.Fatalf("status = %q", m.status)
+	}
+}
+
+func TestPullFraction(t *testing.T) {
+	l := func(status string, cur, total int64) docker.LayerProgress {
+		return docker.LayerProgress{Status: status, Current: cur, Total: total}
+	}
+	tests := []struct {
+		layer docker.LayerProgress
+		want  float64
+	}{
+		{l("Waiting", 0, 0), 0},
+		{l("Downloading", 50, 100), 0.4},
+		{l("Download complete", 0, 0), 0.8},
+		{l("Extracting", 50, 100), 0.9},
+		{l("Pull complete", 0, 0), 1},
+		{l("Already exists", 0, 0), 1},
+		{l("Downloading", 0, 0), 0}, // unknown size
+	}
+	for _, tt := range tests {
+		if got := layerFraction(tt.layer); math.Abs(got-tt.want) > 1e-9 {
+			t.Errorf("%s %d/%d: %.2f, want %.2f", tt.layer.Status, tt.layer.Current, tt.layer.Total, got, tt.want)
+		}
+	}
+	p := docker.PullProgress{Layers: []docker.LayerProgress{l("Pull complete", 0, 0), l("Waiting", 0, 0)}}
+	if got := pullFraction(p); got != 0.5 {
+		t.Errorf("overall = %.2f", got)
+	}
+	p.Done = true
+	if pullFraction(p) != 1 {
+		t.Error("a finished pull is 100%")
 	}
 }

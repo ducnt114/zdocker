@@ -30,6 +30,7 @@ const (
 	viewVolumes
 	viewNetworks
 	viewContexts
+	viewPull
 )
 
 // connectedMsg reports the result of a Ping. client says which client it
@@ -74,6 +75,7 @@ type Model struct {
 	volumes    listView[docker.Volume]
 	networks   listView[docker.Network]
 	contexts   listView[docker.Context]
+	pull       pullView
 	// ctx is the docker context in use. It is a pointer so that the
 	// contexts view (which keeps a closure reading it) sees updates: the
 	// Model itself is copied on every Update, a closure over one copy
@@ -123,13 +125,14 @@ func (m *Model) useClient(c docker.Client) {
 	m.stats = newStatsView()
 	m.volumes = newListView(c, volumesSpec)
 	m.networks = newListView(c, networksSpec)
+	m.pull = newPullView()
 	m.layout()
 }
 
 func newCommandInput() textinput.Model {
 	ti := textinput.New()
 	ti.Prompt = ":"
-	ti.Placeholder = "containers | images | volumes | networks | ctx | quit"
+	ti.Placeholder = "containers | images | volumes | networks | ctx | pull <image> | quit"
 	return ti
 }
 
@@ -214,6 +217,17 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.useClient(msg.client)
 		m.status, m.statusIsErr = fmt.Sprintf("connecting to context %q…", msg.name), false
 		return m, ping(m.client)
+
+	case prefillCommandMsg:
+		m.commandMode = true
+		m.command.SetValue(msg.text)
+		m.command.CursorEnd()
+		return m, m.command.Focus()
+
+	case pullStartedMsg, pullProgressMsg, pullEndedMsg:
+		var cmd tea.Cmd
+		m.pull, cmd = m.pull.Update(msg)
+		return m, cmd
 
 	case listLoadedMsg[docker.Context]:
 		var cmd tea.Cmd
@@ -388,6 +402,17 @@ func (m Model) runCommand(input string) (tea.Model, tea.Cmd) {
 	case "networks", "network", "net", "n":
 		m.setActive(viewNetworks)
 		return m, nil
+	case "pull":
+		if len(fields) < 2 {
+			return m, reportErr(fmt.Errorf("usage: :pull <image>[:tag]"))
+		}
+		if m.opts.ReadOnly {
+			return m, reportErr(docker.ErrReadOnly)
+		}
+		m.returnTo = viewImages // esc from the pull view shows the images
+		cmd := m.pull.open(m.client, fields[1])
+		m.setActive(viewPull)
+		return m, cmd
 	case "ctx", "context", "contexts":
 		if len(fields) > 1 {
 			return m.Update(switchContextMsg{name: fields[1]})
@@ -408,6 +433,9 @@ func (m *Model) setActive(v viewID) {
 	}
 	if m.active == viewStats && v != viewStats {
 		m.stats.stop()
+	}
+	if m.active == viewPull && v != viewPull {
+		m.pull.stop() // like ctrl+c on docker pull
 	}
 	m.active = v
 	m.layout()
@@ -432,6 +460,8 @@ func (m Model) updateActive(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.networks, cmd = m.networks.Update(msg)
 	case viewContexts:
 		m.contexts, cmd = m.contexts.Update(msg)
+	case viewPull:
+		m.pull, cmd = m.pull.Update(msg)
 	}
 	return m, cmd
 }
@@ -454,6 +484,8 @@ func (m Model) activeCapturingInput() bool {
 		return m.networks.capturingInput()
 	case viewContexts:
 		return m.contexts.capturingInput()
+	case viewPull:
+		return m.pull.capturingInput()
 	}
 	return false
 }
@@ -476,6 +508,8 @@ func (m Model) activeKeys() helpKeys {
 		return helpKeys{view: m.networks.keys(m.opts.ReadOnly)}
 	case viewContexts:
 		return helpKeys{view: m.contexts.keys(m.opts.ReadOnly)}
+	case viewPull:
+		return helpKeys{view: m.pull.keys()}
 	}
 	return helpKeys{}
 }
@@ -495,6 +529,7 @@ func (m *Model) layout() {
 	m.volumes.SetSize(m.width, m.bodyHeight)
 	m.networks.SetSize(m.width, m.bodyHeight)
 	m.contexts.SetSize(m.width, m.bodyHeight)
+	m.pull.SetSize(m.width, m.bodyHeight)
 }
 
 func (m Model) View() string {
@@ -519,6 +554,8 @@ func (m Model) View() string {
 		body = m.networks.View()
 	case viewContexts:
 		body = m.contexts.View()
+	case viewPull:
+		body = m.pull.View()
 	}
 	// Pin the body height so the status and help bars stay at the bottom.
 	body = lipgloss.NewStyle().Height(m.bodyHeight).MaxHeight(m.bodyHeight).Render(body)

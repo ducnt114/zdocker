@@ -21,6 +21,7 @@ zdocker là "anh em" của [kboba](https://github.com/ducnt114/kboba): cùng ki�
 10. [Phase 2.1: Volumes và Networks](#10-phase-21-volumes-và-networks)
 11. [Phase 2.2: Nhóm theo Compose project](#11-phase-22-nhóm-theo-compose-project)
 12. [Phase 2.3: Docker context](#12-phase-23-docker-context)
+13. [Phase 2.4: Pull image](#13-phase-24-pull-image)
 
 ---
 
@@ -425,7 +426,7 @@ So với kboba, zdocker cho thấy cùng một kiến trúc Bubble Tea áp vào 
 | 2.1 | Volumes, Networks | View generic `listView[T]`, message generic | ✅ [mục 10](#10-phase-21-volumes-và-networks) |
 | 2.2 | Nhóm theo Docker Compose project | Nhóm/gập dòng trong bảng, label `com.docker.compose.*` | ✅ [mục 11](#11-phase-22-nhóm-theo-compose-project) |
 | 2.3 | Chọn docker context (`:ctx`) | Đọc `~/.docker/contexts`, tạo lại client như kboba đổi kube context | ✅ [mục 12](#12-phase-23-docker-context) |
-| 2.4 | `pull` image (có tiến trình) | Stream JSON tiến trình của từng layer, progress bar | ⏳ |
+| 2.4 | `pull` image (có tiến trình) | Stream JSON tiến trình của từng layer, progress bar | ✅ [mục 13](#13-phase-24-pull-image) |
 | 2.5 | `prune` (containers đã dừng, images dangling) | Thao tác hàng loạt, xác nhận kèm con số sẽ bị xoá | ⏳ |
 | 2.6 | `exec` vào shell của container | `tea.ExecProcess`: tạm nhường terminal cho `docker exec -it` rồi quay lại TUI | ⏳ |
 | 2.7 | Cột CPU/MEM ngay trong bảng containers | Nhiều stream stats song song hoặc lấy mẫu một lần có giới hạn | ⏳ |
@@ -593,4 +594,46 @@ Bảng không nhóm (images, volumes…) có mọi dòng cùng `group == ""` →
 | Quên dừng stream của kết nối cũ khi chuyển | `events.stop()` + `setActive` (dừng logs/stats) trước `useClient` |
 | Con trỏ ở dòng đầu thay vì context đang dùng → Enter nhầm | `filterTable.Select(active)` mỗi lần danh sách được nạp |
 | Context `ssh://`: CLI chạy `ssh … docker system dial-stdio` và nối stdin/stdout làm kết nối | Chưa hỗ trợ (cần SSH server để kiểm chứng) — báo lỗi rõ ràng thay vì làm một nửa; có thể làm sau bằng `client.WithDialContext` + một `net.Conn` bọc tiến trình `ssh` |
+
+## 13. Phase 2.4: Pull image
+
+### Mục tiêu
+`:pull <image>[:tag]` (hoặc `p` trong bảng images: mở command bar với `pull <repo:tag của dòng đang chọn>`) → một màn hình tiến trình như `docker pull`: thanh tổng có phần trăm, một thanh mỗi layer kèm số byte, dòng trạng thái cuối (`Status: Downloaded newer image for …`). `esc` huỷ pull đang chạy. Xong thì bảng images tự có image mới (event `pull`). Bị chặn khi `--read-only`.
+
+### Học được gì
+- **Giao thức pull**: `POST /images/create?fromImage=…&tag=…` trả về một stream các object JSON. Mỗi layer có chuỗi trạng thái riêng (`Pulling fs layer` → `Waiting` → `Downloading` (kèm `progressDetail{current,total}`) → `Verifying Checksum` → `Download complete` → `Extracting` → `Pull complete`, hoặc `Already exists`), **xen kẽ** giữa các layer; cộng vài dòng chung (`Pulling from …`, `Digest: …`, `Status: …`). Lỗi (`manifest unknown`, `pull access denied`) đến *trong* stream dưới dạng `errorDetail`, không phải mã HTTP.
+- **Iterator (range-over-func, Go 1.23)**: Moby trả `JSONMessages(ctx) iter.Seq2[jsonstream.Message, error]`; dùng `for msg, err := range resp.JSONMessages(ctx)`. Iterator của Moby tự đóng body khi `ctx` bị huỷ (`context.AfterFunc`).
+- **Gấp (fold) một stream sự kiện thành trạng thái**: UI không cần từng message mà cần "mỗi layer đang ở đâu" → `PullProgress{Layers, Status, Done, Err}`, gửi *bản chụp* (snapshot) sau mỗi message.
+- **Snapshot phải là bản sao**: slice `Layers` được gửi qua channel trong khi goroutine tiếp tục sửa → phải copy, nếu không UI đọc dữ liệu đang bị ghi (data race, và test đã kiểm tra hai snapshot liên tiếp độc lập).
+- **Chỉ snapshot mới nhất là quan trọng**: `receiveBatch` lấy cả loạt, UI chỉ giữ phần tử cuối — gộp hàng trăm update/giây thành một lần vẽ.
+- **Component có sẵn**: `bubbles/progress` (`ViewAs(percent)` vẽ thanh tĩnh, có gradient). Cần thêm module `harmonica` (animation lò xo của Charm) mà `progress` phụ thuộc.
+
+### Thể hiện trong code
+
+**`internal/docker/pull.go` → `PullImage(ctx, ref)`**:
+- Goroutine: `for msg, err := range resp.JSONMessages(ctx)`; `msg.Error` → `state.Err`, gửi, dừng; dòng không phải của layer (hoặc không có ID) → `state.Status`; dòng của layer → tìm/thêm layer theo ID (giữ thứ tự xuất hiện qua map `index`), cập nhật `Status` và byte nếu có `Total`. Hết stream → `Done = true`.
+- `send` copy `Layers` trước khi gửi, và `select` với `ctx.Done()`.
+- `LayerProgress.Done()`: chỉ `Pull complete`/`Already exists` (sau `Download complete` còn bước giải nén).
+- Pull **tạo image** → là thao tác ghi: thêm vào `writeMethods` và `ReadOnly`.
+
+**`internal/ui/pull.go` → `pullView`**: vòng đời như logs/stats (context huỷ được, `gen`, huỷ trong `setActive` khi rời view). `layerFraction` ước lượng tiến độ một layer (tải = 80%, giải nén = 20%), `pullFraction` = trung bình các layer (1 khi `Done`). `View` vẽ bằng `progress.New(…).ViewAs(…)`.
+
+**Root**: `:pull` (kiểm tra cú pháp, chặn khi read-only, `returnTo = viewImages`), `prefillCommandMsg` mở command bar với chữ có sẵn (`CursorEnd` để gõ tiếp).
+
+**Fake daemon chạy được**: `POST /images/create` phát tiến trình 3 layer trong ~3 giây (huỷ được), rồi thêm image và phát event `pull`; tên bắt đầu bằng `nope` → lỗi `manifest unknown` trong stream.
+
+### Test liên quan
+- `internal/docker/pull_test.go`: `TestPullImage` (gấp đúng các layer, `Already exists`, trạng thái cuối, `Done()` không coi `Download complete` là xong, query `fromImage`/`tag`), `TestPullImageError` (lỗi trong stream), `TestPullSnapshotsAreIndependent`.
+- `internal/ui/root_test.go`: `TestPullImage` (thanh 100%, layer, trạng thái, `esc` về images), `TestPullFailure`, `TestPullCancelledOnLeave` (pull đang chạy bị huỷ khi rời view), `TestPullKeyPrefillsCommand`, `TestPullReadOnlyAndUsage`, `TestPullFraction`.
+- Thủ công với fake daemon: thanh tổng 43% giữa chừng, các layer với byte, rồi 100% và image mới xuất hiện trong bảng.
+
+### Bẫy
+| Bẫy | Cách xử lý |
+|---|---|
+| Lỗi pull đến trong stream (HTTP vẫn 200) | Kiểm tra `msg.Error` từng message |
+| Gửi slice đang bị sửa qua channel | Copy `Layers` mỗi snapshot |
+| Vẽ lại hàng trăm lần/giây | Chỉ giữ snapshot cuối của mỗi batch |
+| Coi `Download complete` là xong | Còn `Extracting`; chỉ `Pull complete`/`Already exists` |
+| `progress` cần module `harmonica` | `go get github.com/charmbracelet/bubbles/progress@v1.0.0` |
+| Biểu thức `a || b || c && d` dễ hiểu sai (thứ tự ưu tiên) | Viết lại cho rõ, chỉ còn hai điều kiện |
 

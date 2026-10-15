@@ -26,3 +26,6 @@ func (readOnly) RemoveContainer(context.Context, string, bool) error { return Er
 func (readOnly) RemoveImage(context.Context, string, bool) error     { return ErrReadOnly }
 func (readOnly) RemoveVolume(context.Context, string, bool) error    { return ErrReadOnly }
 func (readOnly) RemoveNetwork(context.Context, string) error         { return ErrReadOnly }
+func (readOnly) PullImage(context.Context, string) (<-chan PullProgress, error) {
+	return nil, ErrReadOnly
+}

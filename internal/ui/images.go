@@ -83,6 +83,14 @@ func (v imagesView) Update(msg tea.Msg) (imagesView, tea.Cmd) {
 			switch {
 			case key.Matches(msg, containerKeyMap.Refresh):
 				return v, v.load()
+			case key.Matches(msg, pullKey):
+				// Opens ":pull " ready to type; on a row, the row's ref
+				// (pulling again fetches a newer image for that tag).
+				text := "pull "
+				if img, ok := v.selected(); ok && img.Repository != "<none>" {
+					text += img.Ref()
+				}
+				return v, func() tea.Msg { return prefillCommandMsg{text: text} }
 			case key.Matches(msg, inspectKey):
 				if img, ok := v.selected(); ok {
 					return v, func() tea.Msg { return openInspectMsg{kind: docker.KindImage, id: img.ID, name: img.Ref()} }
@@ -166,7 +174,7 @@ func (v imagesView) keys(readOnly bool) []key.Binding {
 	k := containerKeyMap
 	b := []key.Binding{k.Up, k.Down, inspectKey}
 	if !readOnly {
-		b = append(b, actionKeys.Remove)
+		b = append(b, actionKeys.Remove, pullKey)
 	}
 	b = append(b, k.Refresh)
 	return append(b, v.table.Keys()...)

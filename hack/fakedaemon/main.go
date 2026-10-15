@@ -156,6 +156,8 @@ func (d *daemon) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		d.mu.Lock()
 		writeJSON(w, d.images)
 		d.mu.Unlock()
+	case "POST /images/create":
+		d.pull(w, r)
 	case "GET /volumes":
 		d.mu.Lock()
 		writeJSON(w, map[string]any{"Volumes": d.volumes})
@@ -303,6 +305,58 @@ func (d *daemon) removeImage(w http.ResponseWriter, r *http.Request, ref string)
 		return
 	}
 	jsonError(w, `{"message":"No such image: `+ref+`"}`, http.StatusNotFound)
+}
+
+// pull streams `docker pull` progress for three layers over ~3 seconds,
+// then adds the image and emits a "pull" event. Names starting with
+// "nope" fail like an unknown repository.
+func (d *daemon) pull(w http.ResponseWriter, r *http.Request) {
+	from, tag := r.URL.Query().Get("fromImage"), r.URL.Query().Get("tag")
+	from = strings.TrimPrefix(strings.TrimPrefix(from, "docker.io/"), "library/")
+	ref := from + ":" + tag
+	w.Header().Set("Content-Type", "application/json")
+	enc := json.NewEncoder(w)
+	flusher := w.(http.Flusher)
+	msg := func(m map[string]any) bool {
+		enc.Encode(m)
+		flusher.Flush()
+		select {
+		case <-r.Context().Done():
+			return false
+		case <-time.After(60 * time.Millisecond):
+			return true
+		}
+	}
+	msg(map[string]any{"status": "Pulling from library/" + from, "id": tag})
+	if strings.HasPrefix(from, "nope") {
+		msg(map[string]any{"errorDetail": map[string]any{"message": "manifest for " + ref + " not found: manifest unknown"}, "error": "manifest unknown"})
+		return
+	}
+	layers := map[string]int64{"9a1b2c3d4e5f": 3_400_000, "8f7e6d5c4b3a": 28_100_000, "7d6c5b4a3f2e": 640}
+	order := []string{"9a1b2c3d4e5f", "8f7e6d5c4b3a", "7d6c5b4a3f2e"}
+	for _, id := range order {
+		msg(map[string]any{"status": "Pulling fs layer", "id": id})
+	}
+	for step := int64(1); step <= 10; step++ {
+		for _, id := range order {
+			total := layers[id]
+			if !msg(map[string]any{"status": "Downloading", "id": id, "progressDetail": map[string]any{"current": total * step / 10, "total": total}}) {
+				return
+			}
+		}
+	}
+	for _, id := range order {
+		msg(map[string]any{"status": "Extracting", "id": id, "progressDetail": map[string]any{"current": layers[id], "total": layers[id]}})
+		msg(map[string]any{"status": "Pull complete", "id": id})
+	}
+	msg(map[string]any{"status": "Digest: sha256:0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c4b5a69788796a5b4c3d2e1f0"})
+	msg(map[string]any{"status": "Status: Downloaded newer image for " + ref})
+
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	id := fmt.Sprintf("sha256:%064x", time.Now().UnixNano())
+	d.images = append(d.images, image.Summary{ID: id, RepoTags: []string{ref}, Size: 31_500_640, Created: time.Now().Unix()})
+	d.publishImage(id, ref, events.ActionPull)
 }
 
 func (d *daemon) volumeEndpoint(w http.ResponseWriter, r *http.Request, name string) {

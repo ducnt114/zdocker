@@ -65,10 +65,11 @@ header shows `● live` or `○ reconnecting`.
 | `R` | restart container (asks first) |
 | `D` | remove container / image / volume / network (asks first; a running container is killed) |
 | `t` | live stats (CPU, memory, network, block I/O) with sparklines |
+| `p` | (images) pull: opens `:pull repo:tag`, with progress per layer |
 | `a` | toggle all / running containers |
 | `g` | group containers by Docker Compose project (`enter` on a project folds it) |
 | `r` | refresh |
-| `:` | command (`:containers`/`:ps`, `:images`/`:img`, `:volumes`/`:vol`, `:networks`/`:net`, `:ctx [name]`, `:q`) |
+| `:` | command (`:containers`/`:ps`, `:images`/`:img`, `:volumes`/`:vol`, `:networks`/`:net`, `:ctx [name]`, `:pull image[:tag]`, `:q`) |
 | `?` | help |
 | `q` | quit |
 
