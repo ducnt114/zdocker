@@ -36,6 +36,8 @@ type Model struct {
 	client docker.Client
 	server docker.ServerInfo
 
+	events eventsWatcher
+
 	active     viewID
 	containers containersView
 
@@ -58,6 +60,7 @@ func New(c docker.Client) Model {
 
 	return Model{
 		client:     c,
+		events:     eventsWatcher{client: c},
 		active:     viewContainers,
 		containers: newContainersView(c),
 		command:    ti,
@@ -103,10 +106,31 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m.server = msg.info
 		m.status, m.statusIsErr = fmt.Sprintf("connected to %s (API %s)", msg.info.Host, msg.info.APIVersion), false
-		return m, m.containers.load()
+		// List once, then follow events and re-list what changes.
+		return m, tea.Batch(m.containers.load(), m.events.start())
+
+	case eventsStartedMsg, dockerEventsMsg, eventsEndedMsg, debounceMsg, reconnectMsg:
+		var cmd tea.Cmd
+		m.events, cmd = m.events.Update(msg)
+		return m, cmd
+
+	case reloadMsg:
+		var cmds []tea.Cmd
+		if msg.containers {
+			cmds = append(cmds, m.containers.load())
+		}
+		return m, tea.Batch(cmds...)
 
 	// Messages of the containers view, whatever view is active.
-	case containersLoadedMsg, ageTickMsg:
+	case containersLoadedMsg:
+		if msg.err == nil {
+			m.events.healthy() // the daemon answers: reset the reconnect backoff
+		}
+		var cmd tea.Cmd
+		m.containers, cmd = m.containers.Update(msg)
+		return m, cmd
+
+	case ageTickMsg:
 		var cmd tea.Cmd
 		m.containers, cmd = m.containers.Update(msg)
 		return m, cmd
@@ -234,7 +258,17 @@ func (m Model) headerView() string {
 	if m.server.APIVersion != "" {
 		info += "  api: " + m.server.APIVersion
 	}
-	return lipgloss.NewStyle().MaxWidth(m.width).Render(headerStyle.Render("zdocker") + headerInfoStyle.Render(info))
+	var live string
+	switch m.events.state {
+	case eventsLive:
+		live = liveStyle.Render("● live")
+		if m.events.last != "" {
+			live += headerInfoStyle.Render(m.events.last)
+		}
+	case eventsReconnecting:
+		live = reconnectingStyle.Render("○ reconnecting")
+	}
+	return lipgloss.NewStyle().MaxWidth(m.width).Render(headerStyle.Render("zdocker") + headerInfoStyle.Render(info) + live)
 }
 
 func (m Model) statusView() string {

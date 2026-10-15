@@ -92,3 +92,27 @@ func (d *fakeDaemon) client() Client {
 	}
 	return c
 }
+
+// streamEvents makes /events stream the messages sent on ch, as JSON lines,
+// until ch is closed (the stream then ends, like a daemon going away).
+func (d *fakeDaemon) streamEvents(ch <-chan any) {
+	d.handle("GET /events", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/x-ndjson")
+		w.WriteHeader(http.StatusOK)
+		flusher := w.(http.Flusher)
+		flusher.Flush()
+		enc := json.NewEncoder(w)
+		for {
+			select {
+			case m, ok := <-ch:
+				if !ok {
+					return
+				}
+				enc.Encode(m)
+				flusher.Flush()
+			case <-r.Context().Done():
+				return
+			}
+		}
+	})
+}

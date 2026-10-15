@@ -34,6 +34,13 @@ data and runs zdocker against it.
 logger, a crash loop, nginx, a finished job); `make demo-clean` removes only
 those.
 
+## Live updates
+
+zdocker lists containers once, then follows the daemon's event stream and
+re-lists when something changes (debounced), so the table is always current
+without polling. If the daemon goes away it reconnects with backoff; the
+header shows `● live` or `○ reconnecting`.
+
 ## Keys
 
 | Key | Action |

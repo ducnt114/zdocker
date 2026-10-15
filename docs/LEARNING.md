@@ -8,6 +8,7 @@ zdocker là "anh em" của [kboba](https://github.com/ducnt114/kboba): cùng ki�
 
 1. [Bức tranh tổng thể](#1-bức-tranh-tổng-thể)
 2. [Phase (a): Skeleton, kết nối, bảng containers](#2-phase-a-skeleton-kết-nối-bảng-containers)
+3. [Phase (b): Realtime bằng Docker events](#3-phase-b-realtime-bằng-docker-events)
 
 ---
 
@@ -83,3 +84,69 @@ Chạy được `zdocker`: kết nối daemon, hiện bảng containers (NAME, I
 | Port IPv6 hiện sai định dạng | `[::]:8080->80/tcp` khi `IP.Is6()` |
 | Môi trường dev không có Docker daemon | Fake daemon bằng `httptest` (test) và `hack/fakedaemon` (thử tay) |
 | Biến môi trường `DOCKER_*` của máy chạy test làm test sai | Fake daemon test xoá `DOCKER_HOST`, `DOCKER_TLS_VERIFY`, `DOCKER_API_VERSION` bằng `t.Setenv` |
+
+## 3. Phase (b): Realtime bằng Docker events
+
+### Mục tiêu
+Bảng tự cập nhật khi container được tạo, start, die, xoá… — **không poll**. Mất kết nối (daemon restart, socket biến mất) thì tự kết nối lại, và header cho biết trạng thái: `● live container worker: die` hoặc `○ reconnecting`.
+
+### Học được gì
+- **Docker không có informer.** Kubernetes có list + watch với `resourceVersion` nên client có thể duy trì một cache chính xác. Docker chỉ có `/events`: một stream "chuyện gì vừa xảy ra" (`container web: die`), không kèm trạng thái đầy đủ của object. Cách tự nhiên: **list một lần, theo dõi events, list lại khi có thay đổi**.
+- **List lại thay vì tự vá từng dòng**: list qua socket local rất rẻ, và luôn đúng kể cả khi bỏ lỡ event — không phải tái tạo logic "event X thì sửa field Y" của daemon.
+- **Debounce**: `docker compose up` sinh hàng chục event trong một giây; chỉ cần *một* lần list sau khi "lắng xuống".
+- **Reconnect với exponential backoff**: 1s, 2s, 4s… tối đa 30s, và reset khi daemon trả lời bình thường trở lại.
+- **Một API Go cần đọc kỹ**: channel `Messages` trong `EventsResult` của Moby **không bao giờ bị đóng**; lỗi (kể cả hết stream) đến qua `Err`.
+
+### Thể hiện trong code
+
+**k8s-less "watch"** (`internal/docker/events.go` → `Events(ctx)`):
+
+```go
+filters := mobyclient.Filters{}.Add("type", "container", "image")
+res := c.api.Events(ctx, mobyclient.EventsListOptions{Filters: filters})
+go func() {
+    defer close(out)
+    for {
+        select {                                   // phải nghe cả hai channel
+        case m := <-res.Messages: … out <- newEvent(m) …
+        case err := <-res.Err:  if err != nil && ctx.Err() == nil { errs <- err }; return
+        case <-ctx.Done():      return
+        }
+    }
+}()
+```
+
+Trả về đúng "hợp đồng" quen thuộc từ `StreamLogs` của kboba: một channel dữ liệu được đóng khi stream kết thúc, lỗi (nếu có, trừ khi do mình huỷ) được gửi *trước* khi đóng. `newEvent` lấy tên container từ `Actor.Attributes["name"]`.
+
+**Watcher** (`internal/ui/events.go` → `eventsWatcher`): không phải một view — chỉ có state và `Update`, sống trong root model.
+
+```
+connected → events.start() ──► eventsStartedMsg ──► waitForEvents (subscribe)
+dockerEventsMsg  → đánh dấu dirty (container / image), chưa có timer thì tea.Tick(200ms) → debounceMsg
+debounceMsg      → reloadMsg{containers, images} → root gọi containers.load()
+eventsEndedMsg   → stop(), state = reconnecting, backoff = next, tea.Tick(backoff) → reconnectMsg
+reconnectMsg     → start() lại + reloadMsg{tất cả}  (event bị lỡ khi mất kết nối → đồng bộ lại bằng list)
+```
+
+- Mọi message mang `gen` của stream; mỗi lần `start()` tăng `gen`, nên thứ còn sót lại từ stream cũ (một `eventsEndedMsg` đến muộn) bị bỏ qua.
+- **Debounce bằng một cờ**: `debouncing` đảm bảo chỉ có một timer; event đến trong lúc chờ chỉ đánh dấu dirty. Timer kết thúc → một `reloadMsg` gộp tất cả.
+- **Backoff**: `nextBackoff` = 1s, rồi gấp đôi, tối đa 30s. `healthy()` reset về 0 — root gọi nó mỗi khi `ListContainers` thành công. Không reset lúc stream vừa "start" vì `Events()` trả channel ngay cả khi daemon đang chết (lỗi đến ngay sau đó) → reset ở đó sẽ tạo vòng lặp 1s mãi mãi.
+- Header (`Model.headerView`): `● live <event cuối>` (xanh) hoặc `○ reconnecting` (vàng).
+
+**Fake daemon chạy được** có `/events` thật (JSON lines, `Flush` sau mỗi event) và tham số `-restart-every`: container `worker` đổi running ↔ restarting định kỳ, kèm event `die`/`start` — đủ để nhìn bảng cập nhật realtime khi không có Docker.
+
+### Test liên quan
+- `internal/docker/events_test.go`: `TestEventsStream` (fake daemon stream JSON lines; chuyển đổi Kind/Action/Name/Time; query có filter container+image; daemon "biến mất" → channel đóng *và* có lỗi), `TestEventsCancelIsNotAnError`.
+- `internal/ui/root_test.go`: `TestEventsTriggerDebouncedReload` (hai event liên tiếp → chưa list; debounce → đúng **một** lần list; event image không list containers; header có `● live` và event cuối), `TestEventsReconnectWithBackoff` (backoff 1s, context stream cũ bị huỷ, reconnect → stream mới + list lại → backoff reset; `eventsEndedMsg` cũ bị bỏ qua), `TestBackoffGrows` (1, 2, 4, 8, 16, 30, 30).
+- Thủ công với `hack/fakedaemon -restart-every 2s`: `worker` đổi trạng thái theo event; kill daemon → `○ reconnecting` + lỗi "Cannot connect to the Docker daemon…"; chạy lại daemon → tự về `● live`.
+
+### Bẫy
+| Bẫy | Cách xử lý |
+|---|---|
+| `EventsResult.Messages` không bao giờ đóng → goroutine chờ mãi nếu chỉ `range` | `select` trên cả `Messages`, `Err`, `ctx.Done()` |
+| Huỷ context bị báo như lỗi | Chỉ gửi lỗi khi `ctx.Err() == nil` |
+| Burst event → list hàng chục lần | Debounce 200ms bằng một timer duy nhất |
+| Event bị lỡ khi mất kết nối | Reconnect luôn kèm một lần list lại toàn bộ |
+| Reset backoff khi stream "start" → vòng lặp 1s khi daemon chết | Chỉ reset khi một lệnh list thật sự thành công |
+| Test harness bỏ Cmd chờ channel sau 50ms (bài học từ kboba 3.1) | Test đưa `dockerEventsMsg`/`debounceMsg`/`eventsEndedMsg` vào trực tiếp; luồng stream thật được test ở `internal/docker` |
+

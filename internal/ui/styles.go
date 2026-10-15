@@ -20,4 +20,7 @@ var (
 	statusErrorStyle = lipgloss.NewStyle().Foreground(colorError).Bold(true)
 
 	titleStyle = lipgloss.NewStyle().Bold(true).Foreground(colorAccent)
+
+	liveStyle         = lipgloss.NewStyle().Foreground(lipgloss.AdaptiveColor{Light: "#2E7D32", Dark: "#5FD068"})
+	reconnectingStyle = lipgloss.NewStyle().Foreground(lipgloss.AdaptiveColor{Light: "#B58900", Dark: "#F5C542"})
 )

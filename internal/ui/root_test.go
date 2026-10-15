@@ -19,6 +19,21 @@ type fakeClient struct {
 	pingErr    error
 	containers []docker.Container
 	listCalls  []bool // the `all` argument of each ListContainers call
+	streams    []context.Context // one per Events call
+}
+
+// Events returns a stream that stays open (and quiet) until ctx is
+// cancelled; tests inject dockerEventsMsg / eventsEndedMsg directly.
+func (f *fakeClient) Events(ctx context.Context) (<-chan docker.Event, <-chan error) {
+	f.mu.Lock()
+	f.streams = append(f.streams, ctx)
+	f.mu.Unlock()
+	out := make(chan docker.Event)
+	go func() {
+		<-ctx.Done()
+		close(out)
+	}()
+	return out, make(chan error, 1)
 }
 
 func (f *fakeClient) Ping(context.Context) (docker.ServerInfo, error) {
@@ -147,6 +162,99 @@ func TestContainerHealth(t *testing.T) {
 		got := containerHealth(docker.Container{State: tt.state, Status: tt.status})
 		if got != tt.want {
 			t.Errorf("%s / %q: got %d, want %d", tt.state, tt.status, got, tt.want)
+		}
+	}
+}
+
+func TestEventsTriggerDebouncedReload(t *testing.T) {
+	f := newFake()
+	m := startModel(t, f)
+	if len(f.streams) != 1 || m.events.state != eventsLive {
+		t.Fatalf("streams=%d state=%v", len(f.streams), m.events.state)
+	}
+	if !strings.Contains(m.View(), "● live") {
+		t.Fatal("header should show the live indicator")
+	}
+	gen := m.events.gen
+	before := len(f.listCalls)
+
+	// A new container appears; two events arrive in a burst.
+	f.containers = append(f.containers, docker.Container{ID: "n1", Name: "new", State: "running"})
+	m = send(t, m, dockerEventsMsg{gen: gen, events: []docker.Event{{Kind: "container", Action: "create", Name: "new"}}})
+	m = send(t, m, dockerEventsMsg{gen: gen, events: []docker.Event{{Kind: "container", Action: "start", Name: "new"}}})
+	if len(f.listCalls) != before {
+		t.Fatal("must wait for the debounce before re-listing")
+	}
+	if !m.events.debouncing || !strings.Contains(m.View(), "container new: start") {
+		t.Fatalf("debouncing=%v header:\n%s", m.events.debouncing, m.View())
+	}
+
+	m = send(t, m, debounceMsg{gen: gen})
+	if len(f.listCalls) != before+1 {
+		t.Fatalf("one re-list expected for the burst, got %d", len(f.listCalls)-before)
+	}
+	if len(m.containers.items) != 3 {
+		t.Fatalf("items = %d", len(m.containers.items))
+	}
+	// Image events don't re-list containers.
+	m = send(t, m, dockerEventsMsg{gen: gen, events: []docker.Event{{Kind: "image", Action: "pull"}}})
+	m = send(t, m, debounceMsg{gen: gen})
+	if len(f.listCalls) != before+1 {
+		t.Fatal("an image event re-listed containers")
+	}
+}
+
+func TestEventsReconnectWithBackoff(t *testing.T) {
+	f := newFake()
+	m := startModel(t, f)
+	gen := m.events.gen
+
+	m = send(t, m, eventsEndedMsg{gen: gen, err: errors.New("unexpected EOF")})
+	if m.events.state != eventsReconnecting || m.events.backoff != time.Second {
+		t.Fatalf("state=%v backoff=%v", m.events.state, m.events.backoff)
+	}
+	if !strings.Contains(m.status, "lost Docker events (unexpected EOF); reconnecting in 1s") {
+		t.Fatalf("status = %q", m.status)
+	}
+	if f.streams[0].Err() == nil {
+		t.Fatal("the broken stream's context should be cancelled")
+	}
+	if !strings.Contains(m.View(), "○ reconnecting") {
+		t.Fatal("header should show reconnecting")
+	}
+
+	// Reconnect: a new stream, and a full re-list (events were missed).
+	before := len(f.listCalls)
+	m = send(t, m, reconnectMsg{gen: m.events.gen})
+	if len(f.streams) != 2 || m.events.state != eventsLive {
+		t.Fatalf("streams=%d state=%v", len(f.streams), m.events.state)
+	}
+	if len(f.listCalls) != before+1 {
+		t.Fatal("reconnecting must re-list containers")
+	}
+	// The successful list reset the backoff.
+	if m.events.backoff != 0 {
+		t.Fatalf("backoff = %v after a successful list", m.events.backoff)
+	}
+
+	// Leftovers from the old stream are ignored.
+	m = send(t, m, eventsEndedMsg{gen: gen})
+	if m.events.state != eventsLive {
+		t.Fatal("a stale end-of-stream must be ignored")
+	}
+}
+
+func TestBackoffGrows(t *testing.T) {
+	var got []time.Duration
+	d := time.Duration(0)
+	for range 7 {
+		d = nextBackoff(d)
+		got = append(got, d)
+	}
+	want := []time.Duration{1, 2, 4, 8, 16, 30, 30}
+	for i := range want {
+		if got[i] != want[i]*time.Second {
+			t.Fatalf("backoffs = %v", got)
 		}
 	}
 }

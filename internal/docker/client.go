@@ -18,6 +18,11 @@ type Client interface {
 	// ListContainers returns containers sorted by name; all=false returns
 	// only running ones (like `docker ps` without -a).
 	ListContainers(ctx context.Context, all bool) ([]Container, error)
+
+	// Events streams container and image events until ctx is cancelled or
+	// the stream breaks. Callers re-list on events (there is no watch with
+	// resource versions as in Kubernetes).
+	Events(ctx context.Context) (<-chan Event, <-chan error)
 }
 
 // ServerInfo describes the daemon zdocker talks to.

@@ -18,18 +18,20 @@ import (
 	"time"
 
 	"github.com/moby/moby/api/types/container"
+	"github.com/moby/moby/api/types/events"
 )
 
 var versionPrefix = regexp.MustCompile(`^/v[0-9]+\.[0-9]+`)
 
 type daemon struct {
-	mu         sync.Mutex
-	containers []container.Summary
+	mu          sync.Mutex
+	containers  []container.Summary
+	subscribers map[chan events.Message]bool // /events streams
 }
 
 func newDaemon() *daemon {
 	now := time.Now()
-	return &daemon{containers: []container.Summary{
+	return &daemon{subscribers: map[chan events.Message]bool{}, containers: []container.Summary{
 		{ID: "c0ffee000001aaaaaaaaaaaaaaaaaaaa", Names: []string{"/web"}, Image: "nginx:1.27",
 			State: container.StateRunning, Status: "Up 2 hours (healthy)", Created: now.Add(-2 * time.Hour).Unix(),
 			Ports:  []container.PortSummary{{PrivatePort: 80, PublicPort: 8080, Type: "tcp"}},
@@ -57,6 +59,8 @@ func (d *daemon) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		w.Write([]byte("OK"))
 	case "GET /containers/json":
 		d.listContainers(w, r)
+	case "GET /events":
+		d.streamEvents(w, r)
 	default:
 		http.Error(w, `{"message":"fakedaemon: not implemented"}`, http.StatusNotFound)
 	}
@@ -75,6 +79,71 @@ func (d *daemon) listContainers(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, out)
 }
 
+// streamEvents follows the event stream like `docker events`, as JSON
+// lines, until the client goes away.
+func (d *daemon) streamEvents(w http.ResponseWriter, r *http.Request) {
+	ch := make(chan events.Message, 16)
+	d.mu.Lock()
+	d.subscribers[ch] = true
+	d.mu.Unlock()
+	defer func() {
+		d.mu.Lock()
+		delete(d.subscribers, ch)
+		d.mu.Unlock()
+	}()
+
+	w.Header().Set("Content-Type", "application/x-ndjson")
+	w.WriteHeader(http.StatusOK)
+	flusher := w.(http.Flusher)
+	flusher.Flush()
+	enc := json.NewEncoder(w)
+	for {
+		select {
+		case m := <-ch:
+			enc.Encode(m)
+			flusher.Flush()
+		case <-r.Context().Done():
+			return
+		}
+	}
+}
+
+// publish sends an event to every subscriber; d.mu must be held.
+func (d *daemon) publish(id, name string, action events.Action) {
+	m := events.Message{
+		Type: events.ContainerEventType, Action: action, TimeNano: time.Now().UnixNano(),
+		Actor: events.Actor{ID: id, Attributes: map[string]string{"name": name}},
+	}
+	for ch := range d.subscribers {
+		select {
+		case ch <- m:
+		default: // a slow client misses events, like with the real daemon
+		}
+	}
+}
+
+// simulate makes "worker" crash-loop: it restarts every few seconds, with
+// the events a real daemon would emit, so the TUI updates live.
+func (d *daemon) simulate(every time.Duration) {
+	for range time.Tick(every) {
+		d.mu.Lock()
+		for i := range d.containers {
+			c := &d.containers[i]
+			if c.Names[0] != "/worker" {
+				continue
+			}
+			if c.State == container.StateRunning {
+				c.State, c.Status = container.StateRestarting, "Restarting (1) Less than a second ago"
+				d.publish(c.ID, "worker", events.ActionDie)
+			} else {
+				c.State, c.Status = container.StateRunning, "Up Less than a second"
+				d.publish(c.ID, "worker", events.ActionStart)
+			}
+		}
+		d.mu.Unlock()
+	}
+}
+
 func writeJSON(w http.ResponseWriter, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(v)
@@ -82,7 +151,13 @@ func writeJSON(w http.ResponseWriter, v any) {
 
 func main() {
 	addr := flag.String("addr", "127.0.0.1:2375", "address to listen on")
+	restartEvery := flag.Duration("restart-every", 5*time.Second, "how often the fake worker container restarts (0: never)")
 	flag.Parse()
+
+	d := newDaemon()
+	if *restartEvery > 0 {
+		go d.simulate(*restartEvery)
+	}
 	log.Printf("fake Docker daemon on tcp://%s", *addr)
-	log.Fatal(http.ListenAndServe(*addr, newDaemon()))
+	log.Fatal(http.ListenAndServe(*addr, d))
 }
