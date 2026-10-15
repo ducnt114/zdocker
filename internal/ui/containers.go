@@ -27,9 +27,10 @@ type (
 )
 
 var containerKeyMap = struct {
-	Up, Down, Logs, All, Refresh, Group key.Binding
+	Up, Down, Logs, All, Refresh, Group, Metrics key.Binding
 }{
-	Group: key.NewBinding(key.WithKeys("g"), key.WithHelp("g", "group by compose project")),
+	Metrics: key.NewBinding(key.WithKeys("m"), key.WithHelp("m", "cpu/mem columns")),
+	Group:   key.NewBinding(key.WithKeys("g"), key.WithHelp("g", "group by compose project")),
 	// Refresh is the shared refreshKey (r).
 	Logs:    key.NewBinding(key.WithKeys("enter"), key.WithHelp("enter", "logs")),
 	Up:      key.NewBinding(key.WithKeys("up", "k"), key.WithHelp("↑/k", "up")),
@@ -49,12 +50,19 @@ type containersView struct {
 	// a header row per project; collapsed projects show only the header.
 	grouped   bool
 	collapsed map[string]bool
+	// metrics: CPU and MEM columns from one stats stream per running
+	// container (a pointer: shared by the copies of the view).
+	metrics   *statsPool
+	metricsOn bool
+	width     int
+	height    int
 	gen       int // bumped on every load; late results of older loads are dropped
 	now       func() time.Time
 }
 
 func newContainersView(c docker.Client) containersView {
-	return containersView{table: newFilterTable(), client: c, showAll: true, now: time.Now, collapsed: map[string]bool{}}
+	return containersView{table: newFilterTable(), client: c, showAll: true, now: time.Now,
+		collapsed: map[string]bool{}, metrics: newStatsPool(c), metricsOn: true}
 }
 
 // load lists the containers off the UI goroutine.
@@ -88,7 +96,12 @@ func (v containersView) Update(msg tea.Msg) (containersView, tea.Cmd) {
 		}
 		v.loaded = true
 		v.refresh() // keeps the selection by ID
-		return v, nil
+		return v, v.syncMetrics()
+
+	case tableStatsMsg:
+		cmd := v.metrics.receive(msg)
+		v.refresh()
+		return v, cmd
 
 	case ageTickMsg:
 		v.refresh()
@@ -102,6 +115,14 @@ func (v containersView) Update(msg tea.Msg) (containersView, tea.Cmd) {
 				return v, v.load()
 			case key.Matches(msg, containerKeyMap.Refresh):
 				return v, v.load()
+			case key.Matches(msg, containerKeyMap.Metrics):
+				v.metricsOn = !v.metricsOn
+				v.SetSize(v.width, v.height)
+				if !v.metricsOn {
+					v.metrics.stopAll()
+				}
+				v.refresh()
+				return v, v.syncMetrics()
 			case key.Matches(msg, containerKeyMap.Group):
 				v.grouped = !v.grouped
 				v.refresh()
@@ -155,6 +176,30 @@ func (v containersView) selected() (docker.Container, bool) {
 	}
 	c, ok := v.items[id]
 	return c, ok
+}
+
+// syncMetrics starts/stops stats streams to match running containers.
+func (v containersView) syncMetrics() tea.Cmd {
+	if !v.metricsOn {
+		return nil
+	}
+	var running []string
+	for id, c := range v.items {
+		if c.State == "running" {
+			running = append(running, id)
+		}
+	}
+	return v.metrics.sync(running)
+}
+
+// usage renders the CPU and MEM cells, and their sort values.
+func (v containersView) usage(c docker.Container) (cells, sortBy [2]string) {
+	s, ok := v.metrics.latest[c.ID]
+	if !ok || c.State != "running" {
+		return [2]string{"-", "-"}, [2]string{"", ""}
+	}
+	return [2]string{fmt.Sprintf("%.1f%%", s.CPUPercent), formatBinary(s.MemUsed)},
+		[2]string{fmt.Sprintf("%020d", int64(s.CPUPercent*1000)), fmt.Sprintf("%020d", s.MemUsed)}
 }
 
 // groupKeyPrefix marks the keys of project header rows.
@@ -227,7 +272,7 @@ func (v containersView) groupedRows(items []docker.Container) []tableRow {
 		}
 		rows = append(rows, tableRow{
 			key:    groupKeyPrefix + p,
-			cells:  []string{arrow + " " + p, "", "", fmt.Sprintf("%d/%d running", running, len(members)), "", ""},
+			cells:  []string{arrow + " " + p, "", "", fmt.Sprintf("%d/%d running", running, len(members))},
 			filter: strings.Join(names, " "), // a folded group still matches its members
 			style:  style,
 			group:  p,
@@ -251,10 +296,19 @@ func (v containersView) rows(items []docker.Container) []tableRow {
 	now := v.now()
 	rows := make([]tableRow, len(items))
 	for i, c := range items {
+		cells := []string{c.Name, c.Image, c.State, c.Status, c.Ports}
+		sortBy := []string{4: ""}
+		if v.metricsOn {
+			u, us := v.usage(c)
+			cells = append(cells, u[0], u[1])
+			sortBy = append(sortBy, us[0], us[1])
+		}
+		cells = append(cells, formatAge(now.Sub(c.Created)))
+		sortBy = append(sortBy, ageSortKey(c.Created))
 		rows[i] = tableRow{
 			key:    c.ID,
-			cells:  []string{c.Name, c.Image, c.State, c.Status, c.Ports, formatAge(now.Sub(c.Created))},
-			sortBy: []string{5: ageSortKey(c.Created)},
+			cells:  cells,
+			sortBy: sortBy,
 			filter: c.Name + " " + c.Image + " " + c.Project,
 			style:  healthStyles[containerHealth(c)],
 		}
@@ -263,14 +317,18 @@ func (v containersView) rows(items []docker.Container) []tableRow {
 }
 
 func (v *containersView) SetSize(w, h int) {
+	v.width, v.height = w, h
 	v.table.SetSize(w, h)
 	fixed := []tableColumn{
 		{Title: "IMAGE", Width: 24},
 		{Title: "STATE", Width: 10},
 		{Title: "STATUS", Width: 28},
 		{Title: "PORTS", Width: 26},
-		{Title: "AGE", Width: 7},
 	}
+	if v.metricsOn {
+		fixed = append(fixed, tableColumn{Title: "CPU", Width: 6}, tableColumn{Title: "MEM", Width: 8})
+	}
+	fixed = append(fixed, tableColumn{Title: "AGE", Width: 7})
 	used := 0
 	for _, c := range fixed {
 		used += c.Width + 2
@@ -301,6 +359,6 @@ func (v containersView) keys(readOnly bool) []key.Binding {
 		a := actionKeys
 		b = append(b, execKey, a.Start, a.Stop, a.Restart, a.Remove)
 	}
-	b = append(b, k.All, k.Group, k.Refresh)
+	b = append(b, k.All, k.Group, k.Metrics, k.Refresh)
 	return append(b, v.table.Keys()...)
 }

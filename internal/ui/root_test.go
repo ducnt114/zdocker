@@ -30,6 +30,7 @@ type fakeClient struct {
 	writes     []string
 	writeErr   error
 	statsCalls []context.Context
+	statsIDs   []string
 
 	volumes      []docker.Volume
 	networks     []docker.Network
@@ -88,6 +89,7 @@ func (f *fakeClient) RemoveImage(_ context.Context, ref string, force bool) erro
 func (f *fakeClient) ContainerStats(ctx context.Context, id string) (<-chan docker.Stats, <-chan error, error) {
 	f.mu.Lock()
 	f.statsCalls = append(f.statsCalls, ctx)
+	f.statsIDs = append(f.statsIDs, id)
 	f.mu.Unlock()
 	ch := make(chan docker.Stats, 2)
 	now := time.Now()
@@ -763,11 +765,13 @@ func TestReadOnlyMode(t *testing.T) {
 func TestStatsView(t *testing.T) {
 	f := newFake()
 	m := startModel(t, f)
-	m = send(t, m, press("j")) // web
+	m = send(t, m, press("j"))  // web
+	before := len(f.statsCalls) // the table's own CPU/MEM streams
 	m = send(t, m, press("t"))
-	if m.active != viewStats || len(f.statsCalls) != 1 {
-		t.Fatalf("active=%v calls=%d", m.active, len(f.statsCalls))
+	if m.active != viewStats || len(f.statsCalls) != before+1 {
+		t.Fatalf("active=%v calls=%d→%d", m.active, before, len(f.statsCalls))
 	}
+	viewCall := f.statsCalls[before]
 	view := ansi.Strip(m.stats.View())
 	for _, want := range []string{"Stats web", "42.5%", "200MiB / 1GiB (19.5%)", "↓ 1.2MB  ↑ 340kB", "read 4.1kB  write 8.2kB", "peak 42.5%"} {
 		if !strings.Contains(view, want) {
@@ -787,7 +791,7 @@ func TestStatsView(t *testing.T) {
 	}
 
 	m = send(t, m, press("esc"))
-	if m.active != viewContainers || f.statsCalls[0].Err() == nil {
+	if m.active != viewContainers || viewCall.Err() == nil {
 		t.Fatal("leaving the stats view must cancel the stream")
 	}
 }
@@ -1280,4 +1284,106 @@ func TestShellReadOnlyAndExit(t *testing.T) {
 	if !m.statusIsErr || !strings.Contains(m.status, "shell in web: exit status 127") {
 		t.Fatalf("status = %q", m.status)
 	}
+}
+
+// statsStream returns the context of the table's stream for container id.
+func statsStream(f *fakeClient, id string) context.Context {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for i := len(f.statsIDs) - 1; i >= 0; i-- {
+		if f.statsIDs[i] == id {
+			return f.statsCalls[i]
+		}
+	}
+	return nil
+}
+
+func TestTableMetrics(t *testing.T) {
+	f := newFake() // api exited, web running
+	m := startModel(t, f)
+	waitFor(t, func() bool { return statsStream(f, "w1") != nil })
+	if statsStream(f, "a1") != nil {
+		t.Fatal("no stats stream for a stopped container")
+	}
+	cols := m.containers.table.table.cols
+	if cols[5].Title != "CPU" || cols[6].Title != "MEM" {
+		t.Fatalf("columns = %+v", cols)
+	}
+
+	// Samples arrive (injected: the stream goroutines are async).
+	gen := m.containers.metrics.gen
+	m = send(t, m, tableStatsMsg{gen: gen, samples: []statsSample{{id: "w1", s: docker.Stats{CPUPercent: 12.34, MemUsed: 64 << 20}}}})
+	rows := m.containers.table.table.rows
+	if rows[1][5] != "12.3%" || rows[1][6] != "64MiB" || rows[0][5] != "-" {
+		t.Fatalf("rows = %v", rows)
+	}
+
+	// web stops: its stream is cancelled and its numbers dropped.
+	f.containers[1].State, f.containers[1].Status = "exited", "Exited (0) 1 second ago"
+	webStream := statsStream(f, "w1")
+	m = send(t, m, press("r"))
+	if webStream.Err() == nil {
+		t.Fatal("the stream of a stopped container must be cancelled")
+	}
+	if _, ok := m.containers.metrics.latest["w1"]; ok || m.containers.table.table.rows[1][5] != "-" {
+		t.Fatal("stale numbers kept for a stopped container")
+	}
+}
+
+func TestTableMetricsToggleAndSort(t *testing.T) {
+	f := newFake()
+	f.containers = append(f.containers, docker.Container{ID: "b1", Name: "busy", State: "running"})
+	m := startModel(t, f)
+	waitFor(t, func() bool { return statsStream(f, "b1") != nil && statsStream(f, "w1") != nil })
+	gen := m.containers.metrics.gen
+	m = send(t, m, tableStatsMsg{gen: gen, samples: []statsSample{
+		{id: "w1", s: docker.Stats{CPUPercent: 9}},
+		{id: "b1", s: docker.Stats{CPUPercent: 120}}, // more than one CPU
+	}})
+
+	for range 6 { // NAME IMAGE STATE STATUS PORTS CPU
+		m = send(t, m, press("s"))
+	}
+	m = send(t, m, press("S")) // busiest first
+	if got := names(m.containers.table.table.rows); got[0] != "busy" || got[1] != "web" {
+		t.Fatalf("by CPU desc = %v (sort %q)", got, m.containers.table.sortCol)
+	}
+
+	// m turns the columns and every stream off.
+	streams := []context.Context{statsStream(f, "w1"), statsStream(f, "b1")}
+	m = send(t, m, press("m"))
+	if len(m.containers.table.table.cols) != 6 || streams[0].Err() == nil || streams[1].Err() == nil {
+		t.Fatalf("cols=%d cancelled=%v,%v", len(m.containers.table.table.cols), streams[0].Err() != nil, streams[1].Err() != nil)
+	}
+	f.mu.Lock()
+	calls := len(f.statsCalls)
+	f.mu.Unlock()
+	m = send(t, m, press("m")) // and back on: streams restart
+	waitFor(t, func() bool { f.mu.Lock(); defer f.mu.Unlock(); return len(f.statsCalls) >= calls+2 })
+	if len(m.containers.table.table.cols) != 8 {
+		t.Fatalf("cols = %d", len(m.containers.table.table.cols))
+	}
+}
+
+func TestContextSwitchStopsTableMetrics(t *testing.T) {
+	w := &contextWorld{daemons: map[string]*fakeClient{"default": newFake(), "colima": newFake()}}
+	m := startModelWith(t, w.daemons["default"], w.options("default"))
+	waitFor(t, func() bool { return statsStream(w.daemons["default"], "w1") != nil })
+	old := statsStream(w.daemons["default"], "w1")
+	m = typeCommand(t, m, "ctx colima")
+	if old.Err() == nil {
+		t.Fatal("switching context must stop the old daemon's stats streams")
+	}
+}
+
+// waitFor polls cond briefly: the stats pool starts streams in goroutines.
+func waitFor(t *testing.T, cond func() bool) {
+	t.Helper()
+	for range 100 {
+		if cond() {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatal("condition not met in time")
 }

@@ -70,6 +70,7 @@ header shows `● live` or `○ reconnecting`.
 | `x` | stop container (asks first) |
 | `R` | restart container (asks first) |
 | `D` | remove container / image / volume / network (asks first; a running container is killed) |
+| `m` | toggle the CPU / MEM columns (one stats stream per running container) |
 | `t` | live stats (CPU, memory, network, block I/O) with sparklines |
 | `e` | shell in the container (`docker exec -it … bash`/`sh`; needs the docker CLI) |
 | `p` | (images) pull: opens `:pull repo:tag`, with progress per layer |

@@ -214,8 +214,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.err != nil {
 			return m, reportErr(msg.err) // keep using the current context
 		}
-		m.events.stop()             // the old daemon's stream
-		m.setActive(viewContainers) // stops logs/stats streams
+		m.events.stop()                // the old daemon's stream
+		m.containers.metrics.stopAll() // and its stats streams
+		m.setActive(viewContainers)    // stops logs/stats streams
 		m.ctx.name = msg.name
 		m.useClient(msg.client)
 		m.status, m.statusIsErr = fmt.Sprintf("connecting to context %q…", msg.name), false
@@ -315,6 +316,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, tea.Batch(cmds...)
 
 	// Messages of the containers view, whatever view is active.
+	case tableStatsMsg:
+		var cmd tea.Cmd
+		m.containers, cmd = m.containers.Update(msg)
+		return m, cmd
+
 	case containersLoadedMsg:
 		if msg.err == nil {
 			m.events.healthy() // the daemon answers: reset the reconnect backoff

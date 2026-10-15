@@ -24,6 +24,7 @@ zdocker là "anh em" của [kboba](https://github.com/ducnt114/kboba): cùng ki�
 13. [Phase 2.4: Pull image](#13-phase-24-pull-image)
 14. [Phase 2.5: Prune](#14-phase-25-prune)
 15. [Phase 2.6: Shell vào container](#15-phase-26-shell-vào-container)
+16. [Phase 2.7: Cột CPU/MEM trong bảng containers](#16-phase-27-cột-cpumem-trong-bảng-containers)
 
 ---
 
@@ -431,7 +432,7 @@ So với kboba, zdocker cho thấy cùng một kiến trúc Bubble Tea áp vào 
 | 2.4 | `pull` image (có tiến trình) | Stream JSON tiến trình của từng layer, progress bar | ✅ [mục 13](#13-phase-24-pull-image) |
 | 2.5 | `prune` (containers đã dừng, images dangling) | Thao tác hàng loạt, xác nhận kèm con số sẽ bị xoá | ✅ [mục 14](#14-phase-25-prune) |
 | 2.6 | `exec` vào shell của container | `tea.ExecProcess`: tạm nhường terminal cho `docker exec -it` rồi quay lại TUI | ✅ [mục 15](#15-phase-26-shell-vào-container) |
-| 2.7 | Cột CPU/MEM ngay trong bảng containers | Nhiều stream stats song song hoặc lấy mẫu một lần có giới hạn | ⏳ |
+| 2.7 | Cột CPU/MEM ngay trong bảng containers | Nhiều stream stats song song hoặc lấy mẫu một lần có giới hạn | ✅ [mục 16](#16-phase-27-cột-cpumem-trong-bảng-containers) |
 
 ---
 
@@ -718,4 +719,67 @@ Xong thì báo **kết quả thật** từ daemon: `removed 2 container(s), 1 im
 | Shell trên container đã dừng | Kiểm tra `State == running` trước |
 | `--read-only` không chặn exec (không qua client) | Kiểm tra ở root |
 | Không chạy được CLI thật trong test | `shellRunner` với hàm thay được; script `docker` giả khi smoke test |
+
+## 16. Phase 2.7: Cột CPU/MEM trong bảng containers
+
+### Mục tiêu
+Bảng containers có thêm cột **CPU** và **MEM** cho các container đang chạy (`-` cho container dừng), cập nhật mỗi giây, sắp xếp được (`s` tới cột CPU, `S` để lên đầu container ngốn nhất). `m` bật/tắt hai cột (mặc định bật); tắt thì không còn stream nào chạy.
+
+### Học được gì
+- **Lấy số liệu cho N container**: có hai cách — lấy mẫu một lần (`stream=false`) cho từng container định kỳ (mỗi lần daemon phải đo hai điểm cách nhau ~1 giây → chậm, N request mỗi chu kỳ) hoặc **mở một stream mỗi container** như `docker stats` (mỗi stream một mẫu/giây, daemon đẩy). zdocker chọn cách thứ hai.
+- **Đồng bộ một tập tài nguyên với dữ liệu** (reconcile): mỗi lần danh sách container đổi, so "các stream đang có" với "các container đang chạy": thiếu thì mở, thừa thì huỷ — cùng ý tưởng với controller của Kubernetes, ở quy mô nhỏ.
+- **Fan-in không có "kết thúc"**: khác `logmux` của kboba, các stream đến và đi liên tục nên channel chung không bao giờ được đóng; thứ giải phóng goroutine đang chờ là **context của pool** (`select` trên `out` và `ctx.Done()`).
+- **State dùng chung giữa các bản copy của view**: pool (channel, map, goroutine) nằm sau một con trỏ trong `containersView` — view được copy ở mỗi `Update`, pool thì không (cùng lý do với `activeContext` ở phase 2.3).
+- **Mỗi batch vẽ một lần**: N stream × 1 mẫu/giây → waiter gom mọi mẫu sẵn có rồi mới gửi một message.
+
+### Thể hiện trong code
+
+**`internal/ui/statspool.go` → `statsPool`**:
+
+```go
+sync(running []string) tea.Cmd   // mở stream cho container mới chạy, huỷ stream của container không còn chạy
+start(id)                        // goroutine: ContainerStats(ctx con) → forward sang out (select ctx.Done)
+stopAll()                        // huỷ ctx của pool: mọi stream dừng, waiter được giải phóng
+receive(tableStatsMsg) tea.Cmd   // lưu mẫu mới nhất theo ID (bỏ mẫu của stream đã huỷ), đăng ký chờ tiếp
+```
+
+- Cây context: `pool.ctx` → `ctx` của từng container. Huỷ một container = huỷ ctx con; huỷ tất cả = huỷ ctx của pool.
+- `waiting` đảm bảo chỉ có **một** waiter (`waitForTableStats`) — tạo ở lần `sync` đầu có stream, sau đó mỗi batch đăng ký lại (bài học "đừng chờ trên một nguồn rỗng" từ kboba 3.1).
+- `gen` tăng mỗi lần pool khởi động lại → message của pool cũ bị bỏ.
+
+**Containers view**: `metrics *statsPool`, `metricsOn`; `containersLoadedMsg` → `syncMetrics()` (lấy ID các container `running`); `tableStatsMsg` → `receive` + vẽ lại; `usage(c)` → ô `12.3%`/`64MiB` và giá trị sort (số đệm 0, nên `120%` > `9%` khi sắp); cột CPU/MEM chỉ có khi `metricsOn` (đổi số cột → `SetSize` lại).
+
+**Root**: chuyển `tableStatsMsg` cho bảng containers dù đang ở view nào; khi đổi context gọi `containers.metrics.stopAll()` trước `useClient`.
+
+### Test liên quan
+- `internal/ui/root_test.go`: `TestTableMetrics` (chỉ container đang chạy có stream, cột CPU/MEM, mẫu → ô, container dừng → stream bị huỷ và số liệu bị xoá), `TestTableMetricsToggleAndSort` (sắp theo CPU giảm dần với 120% > 9%, `m` tắt cột và huỷ mọi stream, bật lại thì mở lại), `TestContextSwitchStopsTableMetrics`; `TestStatsView` được sửa vì bảng giờ cũng mở stream.
+- Thủ công với fake daemon: 2 container chạy → đúng 2 request `/stats`; các container dừng hiện `-`; `m` bỏ cột.
+
+### Bẫy
+| Bẫy | Cách xử lý |
+|---|---|
+| Channel fan-in không bao giờ đóng → waiter kẹt mãi khi tắt | `select` thêm `ctx.Done()` của pool |
+| Stream của container đã dừng vẫn chạy | `sync` so sánh và huỷ |
+| Số liệu cũ còn hiện sau khi container dừng | Xoá `latest[id]` khi huỷ stream; mẫu đến muộn của stream đã huỷ bị bỏ |
+| Pool bị copy cùng view | Giữ sau con trỏ |
+| Đổi context để lại stream tới daemon cũ | `stopAll()` trước `useClient` |
+| Test đếm số lần gọi stats bị lệch khi bảng cũng mở stream | So sánh trước/sau, tìm stream theo ID container |
+
+---
+
+## Tổng kết Phase 2
+
+| Phase | Ý tưởng chính |
+|---|---|
+| 2.1 | View generic `listView[T]` + message generic — một khuôn cho volumes và networks |
+| 2.2 | Dòng tiêu đề nhóm trong `filterTable`: sort trong nhóm, filter giữ nhóm, không đếm |
+| 2.3 | Docker context: đọc cấu hình CLI, đổi kết nối giữa chừng, closure + model copy → con trỏ |
+| 2.4 | Pull: gấp stream JSON nhiều layer thành snapshot, iterator range-over-func, `bubbles/progress` |
+| 2.5 | Prune: xem trước cụ thể, kết quả thật từ daemon, thứ tự container → image |
+| 2.6 | Shell: `tea.ExecProcess` nhường terminal cho CLI thay vì tự làm `exec -it` |
+| 2.7 | CPU/MEM: một stream mỗi container, reconcile tập stream với danh sách, fan-in giải phóng bằng context |
+
+Những gì Phase 2 *không* phải viết lại: `filterTable`, `actionMsg` + xác nhận + `ReadOnly`, watcher events, các pattern channel → Cmd → message. Phần lớn tính năng mới chỉ là một hàm ở `internal/docker`, một spec hoặc một view nhỏ, và vài dòng định tuyến ở root.
+
+Còn lại cho sau: context `ssh://` (một `net.Conn` bọc tiến trình `ssh … docker system dial-stdio`), build/tag image, logs gộp theo Compose project (như kboba 3.1), và CI chạy `go test -race` cùng một daemon Docker thật.
 
