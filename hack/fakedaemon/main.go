@@ -11,8 +11,8 @@ package main
 import (
 	"encoding/binary"
 	"encoding/json"
-	"fmt"
 	"flag"
+	"fmt"
 	"log"
 	"net/http"
 	"regexp"
@@ -74,6 +74,12 @@ func (d *daemon) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Api-Version", "1.47")
 	w.Header().Set("Ostype", "linux")
 
+	// Image references can contain "/" ("shop/api:dev"): cut prefix and
+	// suffix instead of splitting the path.
+	if r.Method == "GET" && strings.HasPrefix(path, "/images/") && strings.HasSuffix(path, "/json") && path != "/images/json" {
+		d.inspectImage(w, strings.TrimSuffix(strings.TrimPrefix(path, "/images/"), "/json"))
+		return
+	}
 	if id, rest, ok := strings.Cut(strings.TrimPrefix(path, "/containers/"), "/"); ok && strings.HasPrefix(path, "/containers/") && id != "json" {
 		d.containerEndpoint(w, r, id, rest)
 		return
@@ -138,6 +144,27 @@ func (d *daemon) containerEndpoint(w http.ResponseWriter, r *http.Request, ref, 
 	default:
 		http.Error(w, `{"message":"fakedaemon: not implemented"}`, http.StatusNotFound)
 	}
+}
+
+func (d *daemon) inspectImage(w http.ResponseWriter, ref string) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	for _, img := range d.images {
+		match := img.ID == ref || strings.HasPrefix(strings.TrimPrefix(img.ID, "sha256:"), ref)
+		for _, tag := range img.RepoTags {
+			match = match || tag == ref
+		}
+		if match {
+			writeJSON(w, map[string]any{
+				"Id": img.ID, "RepoTags": img.RepoTags, "Size": img.Size,
+				"Created":      time.Unix(img.Created, 0).Format(time.RFC3339Nano),
+				"Architecture": "amd64", "Os": "linux",
+				"Config": map[string]any{"Cmd": []string{"/docker-entrypoint.sh"}, "ExposedPorts": map[string]any{"80/tcp": map[string]any{}}},
+			})
+			return
+		}
+	}
+	http.Error(w, `{"message":"No such image: `+ref+`"}`, http.StatusNotFound)
 }
 
 // streamLogs writes canned logs as a multiplexed stream (8-byte frame

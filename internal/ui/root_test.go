@@ -43,6 +43,13 @@ func (f *fakeClient) ContainerLogs(ctx context.Context, id string, o docker.LogO
 	return lines, make(chan error, 1), nil
 }
 
+func (f *fakeClient) Inspect(_ context.Context, kind docker.Kind, id string) (string, error) {
+	if id == "gone" {
+		return "", errors.New("No such container: gone")
+	}
+	return "{\n  \"Id\": \"" + id + "\",\n  \"Kind\": \"" + string(kind) + "\"\n}", nil
+}
+
 type logCall struct {
 	id   string
 	opts docker.LogOptions
@@ -114,7 +121,7 @@ func TestStartupListsContainers(t *testing.T) {
 	if m.server.APIVersion != "1.47" || !strings.Contains(m.status, "connected to unix:///var/run/docker.sock") {
 		t.Fatalf("server=%+v status=%q", m.server, m.status)
 	}
-	rows := m.containers.table.rows
+	rows := m.containers.table.table.rows
 	if len(rows) != 2 || rows[0][0] != "api" || rows[1][4] != "0.0.0.0:8080->80/tcp" {
 		t.Fatalf("rows = %v", rows)
 	}
@@ -127,7 +134,7 @@ func TestToggleAll(t *testing.T) {
 	f := newFake()
 	m := startModel(t, f)
 	m = send(t, m, press("a"))
-	if m.containers.showAll || len(m.containers.items) != 1 || m.containers.items[0].Name != "web" {
+	if m.containers.showAll || len(m.containers.items) != 1 || m.containers.items["w1"].Name != "web" {
 		t.Fatalf("showAll=%v items=%+v", m.containers.showAll, m.containers.items)
 	}
 	if f.listCalls[len(f.listCalls)-1] {
@@ -304,7 +311,7 @@ func TestImagesView(t *testing.T) {
 	if m.active != viewImages {
 		t.Fatalf("active = %v", m.active)
 	}
-	rows := m.images.table.rows
+	rows := m.images.table.table.rows
 	if len(rows) != 3 {
 		t.Fatalf("rows = %v", rows)
 	}
@@ -411,5 +418,119 @@ func TestLogsStreamEnded(t *testing.T) {
 	m = send(t, m, logStreamEndedMsg{gen: old, err: errors.New("boom")})
 	if m.logs.ended {
 		t.Fatal("stale end-of-stream applied to the new stream")
+	}
+}
+
+func typeKeys(t *testing.T, m Model, s string) Model {
+	t.Helper()
+	for _, r := range s {
+		m = send(t, m, tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{r}})
+	}
+	return m
+}
+
+func names(rows [][]string) []string {
+	var out []string
+	for _, r := range rows {
+		out = append(out, r[0])
+	}
+	return out
+}
+
+func TestFilterContainers(t *testing.T) {
+	m := startModel(t, newFake())
+	m = send(t, m, press("/"))
+	if !m.containers.capturingInput() {
+		t.Fatal("filter should have focus")
+	}
+	m = typeKeys(t, m, "nginx") // matches the image, not the name
+	m = send(t, m, press("enter"))
+	if got := names(m.containers.table.table.rows); len(got) != 1 || got[0] != "web" {
+		t.Fatalf("rows = %v", got)
+	}
+	if !strings.Contains(m.containers.View(), "/nginx") {
+		t.Fatal("title should show the active filter")
+	}
+	// q typed into the filter must not quit.
+	m = send(t, m, press("/"))
+	next, cmd := m.Update(press("q"))
+	m = next.(Model)
+	if cmd != nil {
+		if _, quit := cmd().(tea.QuitMsg); quit {
+			t.Fatal("q quit while typing a filter")
+		}
+	}
+	m = send(t, m, press("esc")) // cancel the input…
+	m = send(t, m, press("esc")) // …nothing left to clear
+	if got := names(m.containers.table.table.rows); len(got) != 2 {
+		t.Fatalf("filter not cleared: %v", got)
+	}
+}
+
+func TestSortImagesBySizeAndAge(t *testing.T) {
+	f := newFake()
+	f.images = append(f.images, docker.Image{ID: "sha256:small", Repository: "busybox", Tag: "1.36", Size: 4_260_000, Created: time.Now().Add(-time.Minute)})
+	m := startModel(t, f)
+	m = typeCommand(t, m, "images")
+
+	// s cycles REPOSITORY → TAG → IMAGE ID → SIZE.
+	for range 4 {
+		m = send(t, m, press("s"))
+	}
+	if m.images.table.sortCol != "SIZE" {
+		t.Fatalf("sortCol = %q", m.images.table.sortCol)
+	}
+	// By bytes: 5kB < 4.26MB < 187MB (as text "187MB" < "4.26MB" < "5kB").
+	if got := names(m.images.table.table.rows); got[0] != "<none>" || got[1] != "busybox" || got[3] != "nginx" {
+		t.Fatalf("by size = %v", got)
+	}
+	if !strings.Contains(m.images.table.table.cols[3].Title, "SIZE↑") {
+		t.Fatalf("header = %q", m.images.table.table.cols[3].Title)
+	}
+	// AGE: youngest first.
+	m = send(t, m, press("s"))
+	m = send(t, m, press("s"))
+	if m.images.table.sortCol != "AGE" || names(m.images.table.table.rows)[0] != "busybox" {
+		t.Fatalf("by age = %v (%q)", names(m.images.table.table.rows), m.images.table.sortCol)
+	}
+	m = send(t, m, press("S"))
+	if names(m.images.table.table.rows)[0] != "<none>" {
+		t.Fatalf("reversed age = %v", names(m.images.table.table.rows))
+	}
+}
+
+func TestSelectionSurvivesSortAndFilter(t *testing.T) {
+	m := startModel(t, newFake())
+	m = send(t, m, press("j")) // web
+	m = send(t, m, press("S")) // reverse: web is now first
+	if c, _ := m.containers.selected(); c.Name != "web" {
+		t.Fatalf("selected %q after sort", c.Name)
+	}
+}
+
+func TestInspect(t *testing.T) {
+	m := startModel(t, newFake())
+	m = typeCommand(t, m, "images")
+	m = send(t, m, press("j")) // nginx:1.27
+	m = send(t, m, press("i"))
+	if m.active != viewInspect {
+		t.Fatalf("active = %v", m.active)
+	}
+	view := ansi.Strip(m.inspect.View())
+	if !strings.Contains(view, "Inspect image nginx:1.27") || !strings.Contains(view, `"Kind": "image"`) {
+		t.Fatalf("view:\n%s", view)
+	}
+	// esc returns to the images table it came from.
+	m = send(t, m, press("esc"))
+	if m.active != viewImages {
+		t.Fatalf("active = %v", m.active)
+	}
+
+	// A late answer for another object is ignored.
+	m = typeCommand(t, m, "ps")
+	m = send(t, m, press("i"))
+	m = send(t, m, inspectLoadedMsg{id: "image:sha256:other", text: "stale"})
+	if strings.Contains(ansi.Strip(m.inspect.View()), "stale") {
+		t.Fatal("stale inspect result shown")
 	}
 }

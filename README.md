@@ -53,6 +53,9 @@ header shows `● live` or `○ reconnecting`.
 |---|---|
 | `↑↓ jk` | move |
 | `enter` | logs of the selected container |
+| `i` | inspect the selected container / image (JSON) |
+| `/` | filter (name, image, compose project / repo:tag, ID) |
+| `s`, `S` | sort by next column, reverse |
 | `a` | toggle all / running containers |
 | `r` | refresh |
 | `:` | command (`:containers`/`:ps`, `:images`/`:img`, `:q`) |

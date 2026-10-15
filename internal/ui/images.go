@@ -8,7 +8,6 @@ import (
 
 	"github.com/charmbracelet/bubbles/key"
 	tea "github.com/charmbracelet/bubbletea"
-	"github.com/charmbracelet/lipgloss"
 
 	"github.com/ducnt114/zdocker/internal/docker"
 )
@@ -21,16 +20,17 @@ type imagesLoadedMsg struct {
 
 // imagesView is the table of images (one row per tag).
 type imagesView struct {
-	table  tableModel
+	table  filterTable
 	client docker.Client
-	items  []docker.Image
+	items  map[string]docker.Image // by imageRowKey
+	order  []docker.Image          // as listed, for re-rendering
 	loaded bool
 	gen    int
 	now    func() time.Time
 }
 
 func newImagesView(c docker.Client) imagesView {
-	return imagesView{table: newTableModel(), client: c, now: time.Now}
+	return imagesView{table: newFilterTable(), client: c, now: time.Now}
 }
 
 func (v *imagesView) load() tea.Cmd {
@@ -44,22 +44,17 @@ func (v *imagesView) load() tea.Cmd {
 	}
 }
 
-// rowKey identifies a row: an image ID alone isn't unique (several tags).
+// imageRowKey identifies a row: an image ID alone isn't unique (several
+// tags give several rows).
 func imageRowKey(i docker.Image) string { return i.ID + " " + i.Repository + ":" + i.Tag }
 
 func (v imagesView) selected() (docker.Image, bool) {
-	i := v.table.Cursor()
-	if i < 0 || i >= len(v.items) {
+	k, ok := v.table.Selected()
+	if !ok {
 		return docker.Image{}, false
 	}
-	return v.items[i], true
-}
-
-func (v imagesView) selectedKey() string {
-	if img, ok := v.selected(); ok {
-		return imageRowKey(img)
-	}
-	return ""
+	img, ok := v.items[k]
+	return img, ok
 }
 
 func (v imagesView) Update(msg tea.Msg) (imagesView, tea.Cmd) {
@@ -71,18 +66,29 @@ func (v imagesView) Update(msg tea.Msg) (imagesView, tea.Cmd) {
 		if msg.err != nil {
 			return v, reportErr(msg.err)
 		}
-		selected := v.selectedKey() // before replacing the items
-		v.items, v.loaded = msg.items, true
-		v.setRows(selected)
+		v.order, v.loaded = msg.items, true
+		v.items = make(map[string]docker.Image, len(msg.items))
+		for _, img := range msg.items {
+			v.items[imageRowKey(img)] = img
+		}
+		v.table.SetRows(v.rows())
 		return v, nil
 
 	case ageTickMsg:
-		v.setRows(v.selectedKey())
+		v.table.SetRows(v.rows())
 		return v, nil
 
 	case tea.KeyMsg:
-		if key.Matches(msg, containerKeyMap.Refresh) {
-			return v, v.load()
+		if !v.table.Capturing() {
+			switch {
+			case key.Matches(msg, containerKeyMap.Refresh):
+				return v, v.load()
+			case key.Matches(msg, inspectKey):
+				if img, ok := v.selected(); ok {
+					return v, func() tea.Msg { return openInspectMsg{kind: docker.KindImage, id: img.ID, name: img.Ref()} }
+				}
+				return v, nil
+			}
 		}
 		var cmd tea.Cmd
 		v.table, cmd = v.table.Update(msg)
@@ -91,34 +97,34 @@ func (v imagesView) Update(msg tea.Msg) (imagesView, tea.Cmd) {
 	return v, nil
 }
 
-func (v *imagesView) setRows(selected string) {
+// rows: SIZE sorts by bytes (not "187MB" vs "5kB"), AGE by creation time.
+func (v imagesView) rows() []tableRow {
 	now := v.now()
-	rows := make([][]string, len(v.items))
-	styles := make([]lipgloss.Style, len(v.items))
-	cursor := 0
-	for i, img := range v.items {
+	rows := make([]tableRow, len(v.order))
+	for i, img := range v.order {
 		inUse := "-"
 		if img.Containers > 0 {
 			inUse = strconv.Itoa(img.Containers)
 		}
-		rows[i] = []string{img.Repository, img.Tag, img.ShortID(), formatSize(img.Size), inUse, formatAge(now.Sub(img.Created))}
-		// Unused images are the ones `docker image prune` would consider:
-		// show them muted, dangling ones too.
-		styles[i] = healthStyles[healthy]
+		// Unused images are the ones `docker image prune -a` would remove:
+		// show them muted.
+		style := healthStyles[healthy]
 		if img.Containers == 0 {
-			styles[i] = healthStyles[finished]
+			style = healthStyles[finished]
 		}
-		if imageRowKey(img) == selected {
-			cursor = i
+		rows[i] = tableRow{
+			key:    imageRowKey(img),
+			cells:  []string{img.Repository, img.Tag, img.ShortID(), formatSize(img.Size), inUse, formatAge(now.Sub(img.Created))},
+			sortBy: []string{3: fmt.Sprintf("%020d", img.Size), 4: strconv.Itoa(img.Containers), 5: ageSortKey(img.Created)},
+			filter: img.Repository + ":" + img.Tag + " " + img.ShortID(),
+			style:  style,
 		}
 	}
-	v.table.SetRows(rows, styles)
-	v.table.SetCursor(cursor)
+	return rows
 }
 
 func (v *imagesView) SetSize(w, h int) {
-	v.table.SetWidth(w)
-	v.table.SetHeight(max(h-1, 1))
+	v.table.SetSize(w, h)
 	fixed := []tableColumn{
 		{Title: "TAG", Width: 20},
 		{Title: "IMAGE ID", Width: 12},
@@ -136,24 +142,22 @@ func (v *imagesView) SetSize(w, h int) {
 func (v imagesView) View() string {
 	var total int64
 	seen := map[string]bool{}
-	for _, img := range v.items {
+	for _, img := range v.order {
 		if !seen[img.ID] { // count each image once, not once per tag
 			seen[img.ID] = true
 			total += img.Size
 		}
 	}
-	title := titleStyle.Render(fmt.Sprintf("Images[%d]", len(v.items)))
+	note := "loading…"
 	if v.loaded {
-		title += statusStyle.Render(fmt.Sprintf("  %d images, %s", len(seen), formatSize(total)))
-	} else {
-		title += statusStyle.Render("  loading…")
+		note = fmt.Sprintf("%d images, %s", len(seen), formatSize(total))
 	}
-	return lipgloss.JoinVertical(lipgloss.Left, title, v.table.View())
+	return v.table.View("Images", note)
 }
 
-func (v imagesView) capturingInput() bool { return false }
+func (v imagesView) capturingInput() bool { return v.table.Capturing() }
 
 func (v imagesView) keys() []key.Binding {
 	k := containerKeyMap
-	return []key.Binding{k.Up, k.Down, k.Refresh}
+	return append([]key.Binding{k.Up, k.Down, inspectKey, k.Refresh}, v.table.Keys()...)
 }

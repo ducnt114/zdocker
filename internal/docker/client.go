@@ -27,6 +27,10 @@ type Client interface {
 	// with stdout and stderr told apart.
 	ContainerLogs(ctx context.Context, id string, o LogOptions) (<-chan LogLine, <-chan error, error)
 
+	// Inspect returns `docker inspect` output (indented JSON) for a
+	// container or an image.
+	Inspect(ctx context.Context, kind Kind, id string) (string, error)
+
 	// Events streams container and image events until ctx is cancelled or
 	// the stream breaks. Callers re-list on events (there is no watch with
 	// resource versions as in Kubernetes).

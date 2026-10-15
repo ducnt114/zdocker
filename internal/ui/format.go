@@ -4,6 +4,7 @@ package ui
 
 import (
 	"fmt"
+	"math"
 	"strings"
 	"time"
 )
@@ -64,4 +65,10 @@ func formatSize(n int64) string {
 		s = fmt.Sprintf("%.0f", f)
 	}
 	return s + units[i]
+}
+
+// ageSortKey sorts by age, youngest first: the creation time inverted and
+// zero-padded, so naturalLess orders it like a number.
+func ageSortKey(created time.Time) string {
+	return fmt.Sprintf("%020d", math.MaxInt64-created.UnixNano())
 }

@@ -2,12 +2,12 @@ package ui
 
 import (
 	"context"
-	"fmt"
+	"slices"
+	"strings"
 	"time"
 
 	"github.com/charmbracelet/bubbles/key"
 	tea "github.com/charmbracelet/bubbletea"
-	"github.com/charmbracelet/lipgloss"
 
 	"github.com/ducnt114/zdocker/internal/docker"
 )
@@ -28,27 +28,27 @@ type (
 var containerKeyMap = struct {
 	Up, Down, Logs, All, Refresh key.Binding
 }{
+	// Refresh is the shared refreshKey (r).
 	Logs:    key.NewBinding(key.WithKeys("enter"), key.WithHelp("enter", "logs")),
 	Up:      key.NewBinding(key.WithKeys("up", "k"), key.WithHelp("↑/k", "up")),
 	Down:    key.NewBinding(key.WithKeys("down", "j"), key.WithHelp("↓/j", "down")),
 	All:     key.NewBinding(key.WithKeys("a"), key.WithHelp("a", "all/running")),
-	Refresh: key.NewBinding(key.WithKeys("r"), key.WithHelp("r", "refresh")),
+	Refresh: refreshKey,
 }
 
 // containersView is the table of containers.
 type containersView struct {
-	table   tableModel
+	table   filterTable
 	client  docker.Client
-	items   []docker.Container
-	showAll bool // like `docker ps -a`
+	items   map[string]docker.Container // by ID
+	showAll bool                        // like `docker ps -a`
 	loaded  bool
 	gen     int // bumped on every load; late results of older loads are dropped
-	width   int
 	now     func() time.Time
 }
 
 func newContainersView(c docker.Client) containersView {
-	return containersView{table: newTableModel(), client: c, showAll: true, now: time.Now}
+	return containersView{table: newFilterTable(), client: c, showAll: true, now: time.Now}
 }
 
 // load lists the containers off the UI goroutine.
@@ -76,29 +76,37 @@ func (v containersView) Update(msg tea.Msg) (containersView, tea.Cmd) {
 		if msg.err != nil {
 			return v, reportErr(msg.err)
 		}
-		// Remember the selection by ID *before* replacing the items: the
-		// cursor index means nothing in the new list.
-		selected := v.selectedID()
-		v.items, v.loaded = msg.items, true
-		v.setRows(selected)
+		v.items = make(map[string]docker.Container, len(msg.items))
+		for _, c := range msg.items {
+			v.items[c.ID] = c
+		}
+		v.loaded = true
+		v.table.SetRows(v.rows(msg.items)) // keeps the selection by ID
 		return v, nil
 
 	case ageTickMsg:
-		v.refreshRows()
+		v.refresh()
 		return v, ageTick()
 
 	case tea.KeyMsg:
-		switch {
-		case key.Matches(msg, containerKeyMap.All):
-			v.showAll = !v.showAll
-			return v, v.load()
-		case key.Matches(msg, containerKeyMap.Refresh):
-			return v, v.load()
-		case key.Matches(msg, containerKeyMap.Logs):
-			if c, ok := v.selected(); ok {
-				return v, func() tea.Msg { return openLogsMsg{container: c} }
+		if !v.table.Capturing() {
+			switch {
+			case key.Matches(msg, containerKeyMap.All):
+				v.showAll = !v.showAll
+				return v, v.load()
+			case key.Matches(msg, containerKeyMap.Refresh):
+				return v, v.load()
+			case key.Matches(msg, containerKeyMap.Logs):
+				if c, ok := v.selected(); ok {
+					return v, func() tea.Msg { return openLogsMsg{container: c} }
+				}
+				return v, nil
+			case key.Matches(msg, inspectKey):
+				if c, ok := v.selected(); ok {
+					return v, func() tea.Msg { return openInspectMsg{kind: docker.KindContainer, id: c.ID, name: c.Name} }
+				}
+				return v, nil
 			}
-			return v, nil
 		}
 		var cmd tea.Cmd
 		v.table, cmd = v.table.Update(msg)
@@ -109,42 +117,43 @@ func (v containersView) Update(msg tea.Msg) (containersView, tea.Cmd) {
 
 // selected returns the container under the cursor.
 func (v containersView) selected() (docker.Container, bool) {
-	i := v.table.Cursor()
-	if i < 0 || i >= len(v.items) {
+	id, ok := v.table.Selected()
+	if !ok {
 		return docker.Container{}, false
 	}
-	return v.items[i], true
+	c, ok := v.items[id]
+	return c, ok
 }
 
-func (v containersView) selectedID() string {
-	c, _ := v.selected()
-	return c.ID
+// refresh re-renders the rows (e.g. so AGE moves on).
+func (v *containersView) refresh() {
+	items := make([]docker.Container, 0, len(v.items))
+	for _, c := range v.items {
+		items = append(items, c)
+	}
+	slices.SortFunc(items, func(a, b docker.Container) int { return strings.Compare(a.Name, b.Name) })
+	v.table.SetRows(v.rows(items))
 }
 
-// refreshRows re-renders the current items (e.g. to update AGE).
-func (v *containersView) refreshRows() { v.setRows(v.selectedID()) }
-
-// setRows renders the items, putting the cursor on selectedID if present.
-func (v *containersView) setRows(selectedID string) {
+// rows turns containers into table rows. AGE sorts by creation time and
+// the filter searches name, image and compose project.
+func (v containersView) rows(items []docker.Container) []tableRow {
 	now := v.now()
-	rows := make([][]string, len(v.items))
-	styles := make([]lipgloss.Style, len(v.items))
-	cursor := 0
-	for i, c := range v.items {
-		rows[i] = []string{c.Name, c.Image, c.State, c.Status, c.Ports, formatAge(now.Sub(c.Created))}
-		styles[i] = healthStyles[containerHealth(c)]
-		if c.ID == selectedID {
-			cursor = i
+	rows := make([]tableRow, len(items))
+	for i, c := range items {
+		rows[i] = tableRow{
+			key:    c.ID,
+			cells:  []string{c.Name, c.Image, c.State, c.Status, c.Ports, formatAge(now.Sub(c.Created))},
+			sortBy: []string{5: ageSortKey(c.Created)},
+			filter: c.Name + " " + c.Image + " " + c.Project,
+			style:  healthStyles[containerHealth(c)],
 		}
 	}
-	v.table.SetRows(rows, styles)
-	v.table.SetCursor(cursor)
+	return rows
 }
 
 func (v *containersView) SetSize(w, h int) {
-	v.width = w
-	v.table.SetWidth(w)
-	v.table.SetHeight(max(h-1, 1)) // one line for the title
+	v.table.SetSize(w, h)
 	fixed := []tableColumn{
 		{Title: "IMAGE", Width: 24},
 		{Title: "STATE", Width: 10},
@@ -156,8 +165,7 @@ func (v *containersView) SetSize(w, h int) {
 	for _, c := range fixed {
 		used += c.Width + 2
 	}
-	cols := append([]tableColumn{{Title: "NAME", Width: max(w-used-2-2, 16)}}, fixed...)
-	v.table.SetColumns(cols)
+	v.table.SetColumns(append([]tableColumn{{Title: "NAME", Width: max(w-used-2-2, 16)}}, fixed...))
 }
 
 func (v containersView) View() string {
@@ -165,16 +173,16 @@ func (v containersView) View() string {
 	if !v.showAll {
 		scope = "running"
 	}
-	title := titleStyle.Render(fmt.Sprintf("Containers(%s)[%d]", scope, len(v.items)))
+	note := ""
 	if !v.loaded {
-		title += statusStyle.Render("  loading…")
+		note = "loading…"
 	}
-	return lipgloss.JoinVertical(lipgloss.Left, title, v.table.View())
+	return v.table.View("Containers("+scope+")", note)
 }
 
-func (v containersView) capturingInput() bool { return false }
+func (v containersView) capturingInput() bool { return v.table.Capturing() }
 
 func (v containersView) keys() []key.Binding {
 	k := containerKeyMap
-	return []key.Binding{k.Up, k.Down, k.Logs, k.All, k.Refresh}
+	return append([]key.Binding{k.Up, k.Down, k.Logs, inspectKey, k.All, k.Refresh}, v.table.Keys()...)
 }

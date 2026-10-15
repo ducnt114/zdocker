@@ -25,6 +25,7 @@ const (
 	viewContainers viewID = iota
 	viewImages
 	viewLogs
+	viewInspect
 )
 
 // connectedMsg reports the result of the initial Ping.
@@ -44,6 +45,9 @@ type Model struct {
 	containers containersView
 	images     imagesView
 	logs       logsView
+	inspect    inspectView
+	// returnTo is the table logs/inspect go back to.
+	returnTo viewID
 
 	commandMode bool
 	command     textinput.Model
@@ -69,6 +73,7 @@ func New(c docker.Client) Model {
 		containers: newContainersView(c),
 		images:     newImagesView(c),
 		logs:       newLogsView(),
+		inspect:    newInspectView(),
 		command:    ti,
 		help:       help.New(),
 		status:     "connecting…",
@@ -121,12 +126,24 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, cmd
 
 	case openLogsMsg:
+		m.returnTo = m.active
 		cmd := m.logs.open(m.client, msg.container)
 		m.setActive(viewLogs)
 		return m, cmd
 
+	case openInspectMsg:
+		m.returnTo = m.active
+		cmd := m.inspect.open(m.client, msg.kind, msg.id, msg.name)
+		m.setActive(viewInspect)
+		return m, cmd
+
+	case inspectLoadedMsg:
+		var cmd tea.Cmd
+		m.inspect, cmd = m.inspect.Update(msg)
+		return m, cmd
+
 	case backMsg:
-		m.setActive(viewContainers)
+		m.setActive(m.returnTo) // the table logs/inspect were opened from
 		return m, nil
 
 	case logStreamStartedMsg, logLinesMsg, logStreamEndedMsg:
@@ -249,6 +266,8 @@ func (m Model) updateActive(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.images, cmd = m.images.Update(msg)
 	case viewLogs:
 		m.logs, cmd = m.logs.Update(msg)
+	case viewInspect:
+		m.inspect, cmd = m.inspect.Update(msg)
 	}
 	return m, cmd
 }
@@ -261,6 +280,8 @@ func (m Model) activeCapturingInput() bool {
 		return m.images.capturingInput()
 	case viewLogs:
 		return m.logs.capturingInput()
+	case viewInspect:
+		return m.inspect.capturingInput()
 	}
 	return false
 }
@@ -273,6 +294,8 @@ func (m Model) activeKeys() helpKeys {
 		return helpKeys{view: m.images.keys()}
 	case viewLogs:
 		return helpKeys{view: m.logs.keys()}
+	case viewInspect:
+		return helpKeys{view: m.inspect.keys()}
 	}
 	return helpKeys{}
 }
@@ -287,6 +310,7 @@ func (m *Model) layout() {
 	m.containers.SetSize(m.width, m.bodyHeight)
 	m.images.SetSize(m.width, m.bodyHeight)
 	m.logs.SetSize(m.width, m.bodyHeight)
+	m.inspect.SetSize(m.width, m.bodyHeight)
 }
 
 func (m Model) View() string {
@@ -301,6 +325,8 @@ func (m Model) View() string {
 		body = m.images.View()
 	case viewLogs:
 		body = m.logs.View()
+	case viewInspect:
+		body = m.inspect.View()
 	}
 	// Pin the body height so the status and help bars stay at the bottom.
 	body = lipgloss.NewStyle().Height(m.bodyHeight).MaxHeight(m.bodyHeight).Render(body)

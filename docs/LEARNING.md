@@ -11,6 +11,7 @@ zdocker là "anh em" của [kboba](https://github.com/ducnt114/kboba): cùng ki�
 3. [Phase (b): Realtime bằng Docker events](#3-phase-b-realtime-bằng-docker-events)
 4. [Phase (c): Images](#4-phase-c-images)
 5. [Phase (d): Logs](#5-phase-d-logs)
+6. [Phase (e): Inspect, filter, sort](#6-phase-e-inspect-filter-sort)
 
 ---
 
@@ -241,4 +242,66 @@ Enter trên một container → theo dõi log (`docker logs -f --tail 500`): fol
 | Huỷ nhưng `StdCopy` vẫn chặn khi gửi | `send` có `select` trên `ctx.Done()` và trả lỗi |
 | Không có `stdcopy.NewStdWriter` để tạo dữ liệu test | Tự dựng frame bằng `encoding/binary` |
 | Test kỳ vọng Esc rời view ngay, nhưng search còn giữ sau restart | Hành vi đúng (như kboba): Esc đầu xoá search, Esc sau mới rời |
+
+## 6. Phase (e): Inspect, filter, sort
+
+### Mục tiêu
+- `i` trên container hoặc image → `docker inspect` (JSON có tô màu, cuộn ngang, `r` làm mới, Esc về đúng bảng đã mở nó).
+- `/` lọc bảng (containers: theo tên, image, compose project; images: theo `repo:tag` và ID).
+- `s` chọn cột sắp xếp, `S` đảo chiều, mũi tên trên header — cho cả hai bảng.
+
+### Học được gì
+- **Hiện đúng thứ daemon trả về**: `ContainerInspectResult.Raw` là JSON gốc; dùng nó (thay vì encode lại struct đã decode) nghĩa là cả những field mà thư viện client chưa biết (daemon mới hơn client) vẫn hiện ra. Image thì khác: result không có `Raw`, phải xin bằng option `ImageInspectWithRawResponse(&buf)`. Hai API gần giống nhau nhưng không đối xứng — đọc kỹ type.
+- **Tách "hiển thị" và "giá trị để sắp xếp"**: SIZE hiện `187MB` nhưng phải sắp theo số byte (dạng chữ thì `"187MB" < "4.26MB" < "5kB"`); AGE hiện `3h` nhưng sắp theo thời điểm tạo. Mỗi dòng mang `sortBy` song song với `cells`. Kboba xử lý AGE bằng một trường hợp đặc biệt; ở đây một cơ chế chung thay cho mọi trường hợp đặc biệt.
+- **Mã hoá giá trị để so sánh dạng chuỗi**: `naturalLess` so phần số như số, nên chỉ cần biến giá trị thành *chuỗi số đệm 0*: size → `%020d`; tuổi (trẻ nhất trước) → `MaxInt64 - createdNano` đệm 0.
+- **Gom phần lặp lại thành component khi có lần dùng thứ hai**: containers và images cùng cần filter/sort/giữ lựa chọn → `filterTable`.
+
+### Thể hiện trong code
+
+**Inspect** (`internal/docker/inspect.go` → `Inspect(ctx, kind, id)`): container dùng `res.Raw`; image dùng `ImageInspectWithRawResponse(&buf)`; rồi `json.Indent` hai dấu cách. `Kind` (`KindContainer`, `KindImage`) là kiểu riêng của zdocker.
+
+**`inspectView`** (`internal/ui/inspect.go`): viewport + `highlightJSON` (chroma, chạy trong Cmd), id của request (`kind:id`) để bỏ kết quả trễ, `SetHorizontalStep(4)` thay cho wrap (wrap làm hỏng thụt lề) — các ý tưởng từ `detailView` của kboba.
+
+**Quay về đúng bảng** (`Model.returnTo`): khi mở logs hoặc inspect, root ghi nhớ view hiện tại; `backMsg` → `setActive(m.returnTo)`.
+
+**`filterTable`** (`internal/ui/filtertable.go`): `tableModel` + ô `/` + sắp xếp + giữ lựa chọn.
+
+```go
+type tableRow struct {
+    key    string   // để giữ lựa chọn khi dữ liệu đổi
+    cells  []string // hiển thị
+    sortBy []string // (tuỳ chọn) giá trị để sắp xếp từng cột
+    filter string   // text mà "/" tìm trong đó
+    style  lipgloss.Style
+}
+```
+
+- `SetRows` lưu key đang chọn → lọc → sắp → vẽ lại → đặt con trỏ về key đó. View không còn phải tự lo chuyện giữ lựa chọn (bài học phase (a) nằm ở một chỗ).
+- Sắp xếp: `slices.SortStableFunc` với `naturalLess(sortValue(col))`; thế hoà giữ nguyên thứ tự đầu vào (đã sắp theo tên) → dòng bằng nhau không nhảy khi có event. `S` khi chưa chọn cột thì đảo thứ tự mặc định.
+- Ô filter đang focus → `Capturing()` true → root đẩy mọi phím vào (gõ `q` không thoát). Esc: huỷ ô nhập; Esc lần nữa xoá filter nếu còn.
+- `View(title, note)`: dòng tiêu đề gồm số dòng, ghi chú (`loading…`, `5 images, 345MB`) và filter đang áp dụng.
+
+**Views gọn lại**: `containersView`/`imagesView` chỉ còn (1) nạp dữ liệu, (2) dựng `[]tableRow` (cells, sortBy, filter, màu), (3) phím riêng (`enter`, `i`, `a`, `r`). `items` là map theo key để tra từ lựa chọn ra object.
+
+```go
+sortBy: []string{5: ageSortKey(c.Created)}                       // containers: cột 5 = AGE
+sortBy: []string{3: fmt.Sprintf("%020d", img.Size), 4: …, 5: ageSortKey(img.Created)} // images
+```
+
+(Cú pháp `[]string{5: x}` của Go: phần tử ở index 5, các index trước là chuỗi rỗng → `sortValue` rơi về `cells`.)
+
+### Test liên quan
+- `internal/docker/inspect_test.go`: JSON thô có field lạ `FutureField` vẫn hiện; image qua raw option; không tồn tại → lỗi.
+- `internal/ui/root_test.go`: `TestFilterContainers` (khớp theo image, tiêu đề hiện filter, `q` khi đang gõ không thoát, Esc hai lần), `TestSortImagesBySizeAndAge` (theo byte đúng thứ tự ngược với chữ, mũi tên `SIZE↑`, AGE trẻ nhất trước, `S` đảo), `TestSelectionSurvivesSortAndFilter`, `TestInspect` (tiêu đề, nội dung, Esc về bảng images, kết quả trễ bị bỏ); `TestNaturalLess` copy từ kboba.
+- Thủ công với fake daemon: `/shop` lọc ra cả `web` (nhờ compose project), `i` hiện inspect, sort SIZE↓ đúng theo byte.
+
+### Bẫy
+| Bẫy | Cách xử lý |
+|---|---|
+| Encode lại struct đã decode làm mất field mà client chưa biết | Hiện `Raw` của daemon |
+| `ImageInspectResult` không có `Raw` | `ImageInspectWithRawResponse(&buf)` |
+| Sắp xếp SIZE/AGE theo chữ hiển thị | `sortBy` song song, chuỗi số đệm 0 |
+| Trộn đơn vị khi so sánh (`kB`/`MB`) | So số byte, không so chữ |
+| Mỗi view tự viết lại filter/sort/giữ lựa chọn | `filterTable` dùng chung |
+| Đường dẫn `/images/shop/api:dev/json` có `/` trong tham chiếu (fake daemon) | Cắt tiền tố/hậu tố thay vì tách theo `/` |
 
