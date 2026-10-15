@@ -26,8 +26,9 @@ type (
 )
 
 var containerKeyMap = struct {
-	Up, Down, All, Refresh key.Binding
+	Up, Down, Logs, All, Refresh key.Binding
 }{
+	Logs:    key.NewBinding(key.WithKeys("enter"), key.WithHelp("enter", "logs")),
 	Up:      key.NewBinding(key.WithKeys("up", "k"), key.WithHelp("↑/k", "up")),
 	Down:    key.NewBinding(key.WithKeys("down", "j"), key.WithHelp("↓/j", "down")),
 	All:     key.NewBinding(key.WithKeys("a"), key.WithHelp("a", "all/running")),
@@ -93,6 +94,11 @@ func (v containersView) Update(msg tea.Msg) (containersView, tea.Cmd) {
 			return v, v.load()
 		case key.Matches(msg, containerKeyMap.Refresh):
 			return v, v.load()
+		case key.Matches(msg, containerKeyMap.Logs):
+			if c, ok := v.selected(); ok {
+				return v, func() tea.Msg { return openLogsMsg{container: c} }
+			}
+			return v, nil
 		}
 		var cmd tea.Cmd
 		v.table, cmd = v.table.Update(msg)
@@ -170,5 +176,5 @@ func (v containersView) capturingInput() bool { return false }
 
 func (v containersView) keys() []key.Binding {
 	k := containerKeyMap
-	return []key.Binding{k.Up, k.Down, k.All, k.Refresh}
+	return []key.Binding{k.Up, k.Down, k.Logs, k.All, k.Refresh}
 }

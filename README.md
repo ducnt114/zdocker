@@ -34,6 +34,12 @@ data and runs zdocker against it.
 logger, a crash loop, nginx, a finished job); `make demo-clean` removes only
 those.
 
+## Logs
+
+`enter` on a container follows its logs (`docker logs -f --tail 500`):
+`f` follow, `/` `n` `N` search, `w` wrap, `t` timestamps, `←/→` scroll,
+`esc` back. Lines written to stderr are marked with a red bar.
+
 ## Live updates
 
 zdocker lists containers once, then follows the daemon's event stream and
@@ -46,6 +52,7 @@ header shows `● live` or `○ reconnecting`.
 | Key | Action |
 |---|---|
 | `↑↓ jk` | move |
+| `enter` | logs of the selected container |
 | `a` | toggle all / running containers |
 | `r` | refresh |
 | `:` | command (`:containers`/`:ps`, `:images`/`:img`, `:q`) |

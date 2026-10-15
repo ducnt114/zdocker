@@ -9,6 +9,7 @@ import (
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/x/ansi"
 
 	"github.com/ducnt114/zdocker/internal/docker"
 )
@@ -22,6 +23,30 @@ type fakeClient struct {
 	streams    []context.Context // one per Events call
 	images     []docker.Image
 	imageCalls int
+	logCalls   []logCall
+}
+
+// ContainerLogs emits the container's canned lines and stays open (like
+// a follow) until ctx is cancelled.
+func (f *fakeClient) ContainerLogs(ctx context.Context, id string, o docker.LogOptions) (<-chan docker.LogLine, <-chan error, error) {
+	f.mu.Lock()
+	f.logCalls = append(f.logCalls, logCall{id: id, opts: o, ctx: ctx})
+	f.mu.Unlock()
+	lines := make(chan docker.LogLine, 3)
+	lines <- docker.LogLine{Text: "GET /healthz 200"}
+	lines <- docker.LogLine{Text: "WARN slow request", Stderr: true}
+	lines <- docker.LogLine{Text: "GET / 200"}
+	go func() {
+		<-ctx.Done()
+		close(lines)
+	}()
+	return lines, make(chan error, 1), nil
+}
+
+type logCall struct {
+	id   string
+	opts docker.LogOptions
+	ctx  context.Context
 }
 
 func (f *fakeClient) ListImages(context.Context) ([]docker.Image, error) {
@@ -327,5 +352,64 @@ func TestFormatSize(t *testing.T) {
 		if got := formatSize(in); got != want {
 			t.Errorf("formatSize(%d) = %q, want %q", in, got, want)
 		}
+	}
+}
+
+func TestLogsView(t *testing.T) {
+	f := newFake()
+	m := startModel(t, f)
+	m = send(t, m, press("j")) // web
+	m = send(t, m, press("enter"))
+
+	if m.active != viewLogs || len(f.logCalls) != 1 || f.logCalls[0].id != "w1" {
+		t.Fatalf("active=%v calls=%+v", m.active, f.logCalls)
+	}
+	if got := m.logs.buf.len(); got != 3 {
+		t.Fatalf("buffered %d lines", got)
+	}
+	view := ansi.Strip(m.logs.View())
+	if !strings.Contains(view, "Logs web") || !strings.Contains(view, "▍ WARN slow request") || !strings.Contains(view, "  GET / 200") {
+		t.Fatalf("view:\n%s", view)
+	}
+
+	// Search ignores the stderr marker; t restarts with timestamps.
+	m = send(t, m, press("/"))
+	for _, r := range "warn" {
+		m = send(t, m, tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{r}})
+	}
+	m = send(t, m, press("enter"))
+	if len(m.logs.matches) != 1 || m.logs.matches[0] != 1 {
+		t.Fatalf("matches = %v", m.logs.matches)
+	}
+	m = send(t, m, press("t"))
+	if len(f.logCalls) != 2 || !f.logCalls[1].opts.Timestamps || f.logCalls[0].ctx.Err() == nil {
+		t.Fatalf("t should restart the stream with timestamps: %+v", f.logCalls)
+	}
+
+	// The search survives the restart: the first esc clears it, the second
+	// leaves the view and cancels the stream.
+	m = send(t, m, press("esc"))
+	if m.active != viewLogs || m.logs.term != "" {
+		t.Fatalf("first esc: active=%v term=%q", m.active, m.logs.term)
+	}
+	m = send(t, m, press("esc"))
+	if m.active != viewContainers || f.logCalls[1].ctx.Err() == nil {
+		t.Fatalf("active=%v cancelled=%v", m.active, f.logCalls[1].ctx.Err() != nil)
+	}
+}
+
+func TestLogsStreamEnded(t *testing.T) {
+	m := startModel(t, newFake())
+	m = send(t, m, press("enter"))
+	m = send(t, m, logStreamEndedMsg{gen: m.logs.gen})
+	if !m.logs.ended || !strings.Contains(m.status, "log stream closed") {
+		t.Fatalf("ended=%v status=%q", m.logs.ended, m.status)
+	}
+	// A late end from an older stream is ignored after a restart.
+	old := m.logs.gen
+	m = send(t, m, press("t"))
+	m = send(t, m, logStreamEndedMsg{gen: old, err: errors.New("boom")})
+	if m.logs.ended {
+		t.Fatal("stale end-of-stream applied to the new stream")
 	}
 }

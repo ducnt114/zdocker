@@ -23,6 +23,10 @@ type Client interface {
 	// containers using each image.
 	ListImages(ctx context.Context) ([]Image, error)
 
+	// ContainerLogs follows a container's logs until ctx is cancelled,
+	// with stdout and stderr told apart.
+	ContainerLogs(ctx context.Context, id string, o LogOptions) (<-chan LogLine, <-chan error, error)
+
 	// Events streams container and image events until ctx is cancelled or
 	// the stream breaks. Callers re-list on events (there is no watch with
 	// resource versions as in Kubernetes).

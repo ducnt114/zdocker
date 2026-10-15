@@ -24,6 +24,7 @@ type viewID int
 const (
 	viewContainers viewID = iota
 	viewImages
+	viewLogs
 )
 
 // connectedMsg reports the result of the initial Ping.
@@ -42,6 +43,7 @@ type Model struct {
 	active     viewID
 	containers containersView
 	images     imagesView
+	logs       logsView
 
 	commandMode bool
 	command     textinput.Model
@@ -66,6 +68,7 @@ func New(c docker.Client) Model {
 		active:     viewContainers,
 		containers: newContainersView(c),
 		images:     newImagesView(c),
+		logs:       newLogsView(),
 		command:    ti,
 		help:       help.New(),
 		status:     "connecting…",
@@ -115,6 +118,20 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case eventsStartedMsg, dockerEventsMsg, eventsEndedMsg, debounceMsg, reconnectMsg:
 		var cmd tea.Cmd
 		m.events, cmd = m.events.Update(msg)
+		return m, cmd
+
+	case openLogsMsg:
+		cmd := m.logs.open(m.client, msg.container)
+		m.setActive(viewLogs)
+		return m, cmd
+
+	case backMsg:
+		m.setActive(viewContainers)
+		return m, nil
+
+	case logStreamStartedMsg, logLinesMsg, logStreamEndedMsg:
+		var cmd tea.Cmd
+		m.logs, cmd = m.logs.Update(msg)
 		return m, cmd
 
 	case reloadMsg:
@@ -214,6 +231,11 @@ func (m Model) runCommand(input string) (tea.Model, tea.Cmd) {
 }
 
 func (m *Model) setActive(v viewID) {
+	// Leaving the logs view cancels the stream: no goroutine or HTTP
+	// connection is leaked (the single place where this happens).
+	if m.active == viewLogs && v != viewLogs {
+		m.logs.stop()
+	}
 	m.active = v
 	m.layout()
 }
@@ -225,6 +247,8 @@ func (m Model) updateActive(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.containers, cmd = m.containers.Update(msg)
 	case viewImages:
 		m.images, cmd = m.images.Update(msg)
+	case viewLogs:
+		m.logs, cmd = m.logs.Update(msg)
 	}
 	return m, cmd
 }
@@ -235,6 +259,8 @@ func (m Model) activeCapturingInput() bool {
 		return m.containers.capturingInput()
 	case viewImages:
 		return m.images.capturingInput()
+	case viewLogs:
+		return m.logs.capturingInput()
 	}
 	return false
 }
@@ -245,6 +271,8 @@ func (m Model) activeKeys() helpKeys {
 		return helpKeys{view: m.containers.keys()}
 	case viewImages:
 		return helpKeys{view: m.images.keys()}
+	case viewLogs:
+		return helpKeys{view: m.logs.keys()}
 	}
 	return helpKeys{}
 }
@@ -258,6 +286,7 @@ func (m *Model) layout() {
 	m.bodyHeight = max(m.height-chrome, 1)
 	m.containers.SetSize(m.width, m.bodyHeight)
 	m.images.SetSize(m.width, m.bodyHeight)
+	m.logs.SetSize(m.width, m.bodyHeight)
 }
 
 func (m Model) View() string {
@@ -270,6 +299,8 @@ func (m Model) View() string {
 		body = m.containers.View()
 	case viewImages:
 		body = m.images.View()
+	case viewLogs:
+		body = m.logs.View()
 	}
 	// Pin the body height so the status and help bars stay at the bottom.
 	body = lipgloss.NewStyle().Height(m.bodyHeight).MaxHeight(m.bodyHeight).Render(body)

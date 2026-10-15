@@ -10,6 +10,7 @@ zdocker là "anh em" của [kboba](https://github.com/ducnt114/kboba): cùng ki�
 2. [Phase (a): Skeleton, kết nối, bảng containers](#2-phase-a-skeleton-kết-nối-bảng-containers)
 3. [Phase (b): Realtime bằng Docker events](#3-phase-b-realtime-bằng-docker-events)
 4. [Phase (c): Images](#4-phase-c-images)
+5. [Phase (d): Logs](#5-phase-d-logs)
 
 ---
 
@@ -192,4 +193,52 @@ reconnectMsg     → start() lại + reloadMsg{tất cả}  (event bị lỡ khi
 | `localhost:5000/app` bị tách thành repo `localhost`, tag `5000/app` | Phần sau `:` cuối chứa `/` → không phải tag |
 | `Containers` của image summary là `-1` | Tự đếm từ `ContainerList(all)` |
 | `%.3g` in `1e+03` | Phát hiện và in dạng số nguyên |
+
+## 5. Phase (d): Logs
+
+### Mục tiêu
+Enter trên một container → theo dõi log (`docker logs -f --tail 500`): follow `f`, tìm kiếm `/` `n` `N`, wrap `w`, timestamps `t`, cuộn ngang. Dòng **stderr** có vạch đỏ ở lề trái. Rời view thì stream bị huỷ.
+
+### Học được gì
+- **Hai định dạng log của Docker**:
+  - Container **có TTY** (`docker run -t`): một stream thô, stdout và stderr đã hoà làm một từ trong container.
+  - Container **không có TTY** (mặc định): daemon *ghép kênh* (multiplex) stdout và stderr vào một stream gồm các frame: `[loại stream, 0, 0, 0, độ dài big-endian 4 byte] + dữ liệu`. `stdcopy.StdCopy(stdout, stderr, r)` tách lại.
+  - Muốn biết container có TTY không phải `ContainerInspect` trước (`Config.Tty`).
+- **Frame không trùng với dòng**: một dòng có thể bị cắt giữa hai frame, một frame có thể chứa nhiều dòng → cần một writer gom byte rồi cắt theo `\n`.
+- **Giữ thứ tự giữa stdout và stderr**: `StdCopy` ghi các frame *tuần tự trong một goroutine*. Nếu writer gửi dòng ngay khi đủ (thay vì đọc stdout và stderr bằng hai scanner song song qua hai `io.Pipe`), thứ tự xen kẽ được giữ nguyên.
+- **Đánh dấu dữ liệu bằng ký tự điều khiển**: ring buffer chỉ chứa `string`; dòng stderr được tiền tố `\x1f` (Unit Separator — gần như không bao giờ có trong log thật) và bị gỡ trước khi hiển thị/tìm kiếm.
+- **API mới của Moby có thể bỏ phần "ghi" của một gói**: `stdcopy` trong module `api` chỉ còn phía đọc (`StdCopy`); `NewStdWriter` thuộc phía daemon → test tự dựng frame, nhờ đó cũng thấy rõ định dạng.
+
+### Thể hiện trong code
+
+**`internal/docker/logs.go` → `ContainerLogs(ctx, id, opts)`**:
+1. `ContainerInspect` → `tty := Config.Tty`.
+2. `ContainerLogs(ShowStdout, ShowStderr, Follow, Tail: "500", Timestamps)` → một `io.ReadCloser`.
+3. Goroutine: `io.Copy(stdoutWriter, body)` (TTY) hoặc `stdcopy.StdCopy(stdoutWriter, stderrWriter, body)`; cuối cùng `flush()` dòng cuối không có `\n`; lỗi (trừ EOF và huỷ) → `errs`; `close(out)`.
+
+**`lineWriter`**: `Write` nối byte vào `buf`, mỗi khi gặp `\n` thì `send` một `LogLine{Text, Stderr}` (bỏ `\r` cuối của TTY); "dòng" dài quá 1MB không có `\n` thì cắt luôn. `send` dùng `select` với `ctx.Done()` và trả `ctx.Err()` → `StdCopy`/`io.Copy` dừng ngay khi huỷ.
+
+**`internal/ui/logs.go` → `logsView`**: chuyển thể từ logs view của kboba (ring buffer 5000 dòng, `receiveBatch`, render một lần mỗi batch, follow tự tắt khi cuộn lên, search với số dòng tuyệt đối, wrap với bảng `lineOffsets`, generation guard) — các file `logbuffer.go`, `logsearch.go` được copy kèm test và ghi chú nguồn. Phần riêng:
+- Đẩy vào buffer: `stderrMark + text` cho stderr.
+- `render`: `strings.CutPrefix(line, stderrMark)` → gutter `▍ ` đỏ hoặc hai dấu cách; khi wrap, các dòng tiếp theo cũng mang gutter (`ReplaceAll("\n", "\n"+gutter)`), độ rộng wrap trừ 2 cột gutter.
+- Không có `c` (container) hay `p` (previous) như kboba: một container Docker chỉ có một luồng log.
+
+**Root**: `openLogsMsg` (Enter trong bảng containers) → `logs.open`; `setActive` huỷ stream khi rời `viewLogs` (một chỗ dọn dẹp duy nhất, như kboba); `backMsg` → bảng containers.
+
+**Fake daemon chạy được**: `GET /containers/{id|tên}/json` (inspect, không TTY) và `/logs` ghi frame thật (5 dòng cũ, rồi với `follow=1` cứ 700ms một dòng, mỗi dòng thứ 4 là stderr `WARN …`), có `timestamps=1`.
+
+### Test liên quan
+- `internal/docker/logs_test.go`: `TestContainerLogsDemultiplexes` (dòng bị cắt qua hai frame được nối, thứ tự stdout/stderr xen kẽ đúng, `\r\n`, dòng cuối không `\n`, query có `follow/stdout/stderr/tail=500/timestamps`), `TestContainerLogsTTY`, `TestContainerLogsCancel` (follow không bao giờ kết thúc → huỷ thì channel đóng, không báo lỗi), `TestContainerLogsUnknownContainer`.
+- `internal/ui/root_test.go`: `TestLogsView` (gutter stderr, search khớp dòng stderr mà không vướng ký tự đánh dấu, `t` restart với timestamps và huỷ stream cũ, Esc hai tầng rồi huỷ stream), `TestLogsStreamEnded`; cùng các test ring buffer/search copy từ kboba.
+- Thủ công với fake daemon: log chảy liên tục, dòng `WARN` có vạch đỏ (kiểm bằng `tmux capture-pane -e`).
+
+### Bẫy
+| Bẫy | Cách xử lý |
+|---|---|
+| Đọc log của container không TTY như text thường → rác 8 byte đầu mỗi frame | Inspect `Config.Tty`, dùng `stdcopy.StdCopy` |
+| Dòng bị cắt giữa hai frame | `lineWriter` gom byte, cắt theo `\n` |
+| Hai scanner song song cho stdout/stderr → đảo thứ tự | Gửi dòng ngay trong `Write`, cùng goroutine với `StdCopy` |
+| Huỷ nhưng `StdCopy` vẫn chặn khi gửi | `send` có `select` trên `ctx.Done()` và trả lỗi |
+| Không có `stdcopy.NewStdWriter` để tạo dữ liệu test | Tự dựng frame bằng `encoding/binary` |
+| Test kỳ vọng Esc rời view ngay, nhưng search còn giữ sau restart | Hành vi đúng (như kboba): Esc đầu xoá search, Esc sau mới rời |
 

@@ -9,11 +9,14 @@
 package main
 
 import (
+	"encoding/binary"
 	"encoding/json"
+	"fmt"
 	"flag"
 	"log"
 	"net/http"
 	"regexp"
+	"strings"
 	"sync"
 	"time"
 
@@ -71,6 +74,11 @@ func (d *daemon) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Api-Version", "1.47")
 	w.Header().Set("Ostype", "linux")
 
+	if id, rest, ok := strings.Cut(strings.TrimPrefix(path, "/containers/"), "/"); ok && strings.HasPrefix(path, "/containers/") && id != "json" {
+		d.containerEndpoint(w, r, id, rest)
+		return
+	}
+
 	switch r.Method + " " + path {
 	case "GET /_ping", "HEAD /_ping":
 		w.Write([]byte("OK"))
@@ -98,6 +106,77 @@ func (d *daemon) listContainers(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	writeJSON(w, out)
+}
+
+// find looks a container up by ID, ID prefix or name, like the daemon.
+func (d *daemon) find(ref string) (container.Summary, bool) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	for _, c := range d.containers {
+		if c.ID == ref || strings.HasPrefix(c.ID, ref) || c.Names[0] == "/"+ref {
+			return c, true
+		}
+	}
+	return container.Summary{}, false
+}
+
+func (d *daemon) containerEndpoint(w http.ResponseWriter, r *http.Request, ref, rest string) {
+	c, ok := d.find(ref)
+	if !ok {
+		http.Error(w, `{"message":"No such container: `+ref+`"}`, http.StatusNotFound)
+		return
+	}
+	switch r.Method + " " + rest {
+	case "GET json":
+		writeJSON(w, container.InspectResponse{
+			ID: c.ID, Name: c.Names[0], Image: c.ImageID, Created: time.Unix(c.Created, 0).Format(time.RFC3339Nano),
+			State:  &container.State{Status: c.State, Running: c.State == container.StateRunning},
+			Config: &container.Config{Image: c.Image, Labels: c.Labels, Tty: false},
+		})
+	case "GET logs":
+		streamLogs(w, r, c)
+	default:
+		http.Error(w, `{"message":"fakedaemon: not implemented"}`, http.StatusNotFound)
+	}
+}
+
+// streamLogs writes canned logs as a multiplexed stream (8-byte frame
+// header + payload, stdout or stderr), the format of containers without a
+// TTY; with follow=1 it keeps writing for running containers.
+func streamLogs(w http.ResponseWriter, r *http.Request, c container.Summary) {
+	w.Header().Set("Content-Type", "application/vnd.docker.multiplexed-stream")
+	w.WriteHeader(http.StatusOK)
+	flusher := w.(http.Flusher)
+	timestamps := r.URL.Query().Get("timestamps") == "1"
+	write := func(stream byte, text string) {
+		if timestamps {
+			text = time.Now().UTC().Format(time.RFC3339Nano) + " " + text
+		}
+		header := []byte{stream, 0, 0, 0, 0, 0, 0, 0}
+		binary.BigEndian.PutUint32(header[4:], uint32(len(text)+1))
+		w.Write(header)
+		w.Write([]byte(text + "\n"))
+		flusher.Flush()
+	}
+	name := strings.TrimPrefix(c.Names[0], "/")
+	for i := range 5 {
+		write(1, fmt.Sprintf("%s: earlier line %d", name, i))
+	}
+	if r.URL.Query().Get("follow") != "1" || c.State != container.StateRunning {
+		return
+	}
+	for i := 0; ; i++ {
+		select {
+		case <-r.Context().Done():
+			return
+		case <-time.After(700 * time.Millisecond):
+		}
+		if i%4 == 3 {
+			write(2, fmt.Sprintf("WARN %s: request %d took 1.2s", name, i))
+		} else {
+			write(1, fmt.Sprintf("%s: GET /items/%d 200 12ms", name, i))
+		}
+	}
 }
 
 // streamEvents follows the event stream like `docker events`, as JSON
