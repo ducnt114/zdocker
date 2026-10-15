@@ -18,6 +18,12 @@ type tableRow struct {
 	sortBy []string // optional: what to sort by, per column (default: cells)
 	filter string   // text the "/" filter searches (case-insensitive)
 	style  lipgloss.Style
+
+	// Grouping (optional). Rows with the same group stay together, in the
+	// order the groups first appear; a header row starts its group and
+	// sorting happens within groups.
+	group  string
+	header bool
 }
 
 // sortValue is what column col sorts by.
@@ -86,31 +92,61 @@ func (t *filterTable) SetRows(rows []tableRow) {
 // rebuild filters, sorts and redraws, putting the cursor on selected.
 func (t *filterTable) rebuild(selected string) {
 	term := strings.ToLower(t.input.Value())
+	matches := func(r tableRow) bool { return term == "" || strings.Contains(strings.ToLower(r.filter), term) }
+
+	// Groups with a matching member. A header stays if its own text
+	// matches (it lists its members, so this works for collapsed groups
+	// too) or if a member is visible.
+	liveGroups := map[string]bool{}
+	for _, r := range t.all {
+		if !r.header && matches(r) {
+			liveGroups[r.group] = true
+		}
+	}
+	groupOrder := map[string]int{}
 	t.visible = t.visible[:0]
 	for _, r := range t.all {
-		if term == "" || strings.Contains(strings.ToLower(r.filter), term) {
+		if _, seen := groupOrder[r.group]; !seen {
+			groupOrder[r.group] = len(groupOrder)
+		}
+		if (r.header && (matches(r) || liveGroups[r.group])) || (!r.header && matches(r)) {
 			t.visible = append(t.visible, r)
 		}
 	}
-	if col := t.sortIndex(); col >= 0 {
-		// Stable, and ties keep the given order: live updates don't make
-		// equal rows jump around.
-		slices.SortStableFunc(t.visible, func(a, b tableRow) int {
+
+	col := t.sortIndex()
+	// Stable, and ties keep the given order: live updates don't make
+	// equal rows jump around.
+	slices.SortStableFunc(t.visible, func(a, b tableRow) int {
+		if a.group != b.group { // groups never mix, whatever the sort
+			return groupOrder[a.group] - groupOrder[b.group]
+		}
+		if a.header != b.header { // the header leads its group
+			if a.header {
+				return -1
+			}
+			return 1
+		}
+		c := 0
+		if col >= 0 {
 			va, vb := a.sortValue(col), b.sortValue(col)
-			c := 0
 			switch {
 			case naturalLess(va, vb):
 				c = -1
 			case naturalLess(vb, va):
 				c = 1
 			}
-			if t.sortDesc {
-				c = -c
+		}
+		if t.sortDesc {
+			if col < 0 {
+				return 0 // reversed below, within groups
 			}
-			return c
-		})
-	} else if t.sortDesc {
-		slices.Reverse(t.visible)
+			c = -c
+		}
+		return c
+	})
+	if col < 0 && t.sortDesc {
+		reverseWithinGroups(t.visible)
 	}
 
 	rows := make([][]string, len(t.visible))
@@ -128,6 +164,23 @@ func (t *filterTable) rebuild(selected string) {
 
 func (t filterTable) sortIndex() int {
 	return slices.IndexFunc(t.cols, func(c tableColumn) bool { return c.Title == t.sortCol })
+}
+
+// reverseWithinGroups reverses each group's members, keeping group order
+// and headers in place.
+func reverseWithinGroups(rows []tableRow) {
+	for i := 0; i < len(rows); {
+		j := i
+		for j < len(rows) && rows[j].group == rows[i].group {
+			j++
+		}
+		start := i
+		if rows[start].header {
+			start++
+		}
+		slices.Reverse(rows[start:j])
+		i = j
+	}
 }
 
 // Selected returns the key of the row under the cursor.
@@ -222,7 +275,13 @@ func (t *filterTable) SetSize(w, h int) {
 // View renders the title line (title, row count, note, filter state) and
 // the table.
 func (t filterTable) View(title, note string) string {
-	line := titleStyle.Render(fmt.Sprintf("%s[%d]", title, len(t.visible)))
+	items := 0 // group headers aren't items
+	for _, r := range t.visible {
+		if !r.header {
+			items++
+		}
+	}
+	line := titleStyle.Render(fmt.Sprintf("%s[%d]", title, items))
 	if note != "" {
 		line += statusStyle.Render("  " + note)
 	}

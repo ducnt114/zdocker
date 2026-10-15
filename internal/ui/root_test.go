@@ -858,3 +858,86 @@ func TestVolumeAndNetworkEventsReload(t *testing.T) {
 		t.Fatalf("container create: volumes %d, networks %d", f.volumeCalls-v, f.networkCalls-n)
 	}
 }
+
+func composeFake() *fakeClient {
+	f := newFake()
+	now := time.Now()
+	f.containers = []docker.Container{
+		{ID: "s1", Name: "shop-api-1", Image: "shop/api", State: "exited", Status: "Exited (1) 1 minute ago", Project: "shop", Created: now},
+		{ID: "s2", Name: "shop-web-1", Image: "nginx", State: "running", Status: "Up 1 hour", Project: "shop", Created: now},
+		{ID: "b1", Name: "blog-db-1", Image: "postgres", State: "running", Status: "Up 1 hour", Project: "blog", Created: now},
+		{ID: "x1", Name: "solo", Image: "busybox", State: "running", Status: "Up 1 hour", Created: now},
+	}
+	return f
+}
+
+func TestGroupByComposeProject(t *testing.T) {
+	m := startModel(t, composeFake())
+	m = send(t, m, press("g"))
+	// Grouping keeps the selection on the same container.
+	if k, _ := m.containers.table.Selected(); k != "b1" {
+		t.Fatalf("selected %q after grouping", k)
+	}
+
+	want := []string{"▾ blog", "  blog-db-1", "▾ shop", "  shop-api-1", "  shop-web-1", "▾ (no project)", "  solo"}
+	if got := names(m.containers.table.table.rows); strings.Join(got, "|") != strings.Join(want, "|") {
+		t.Fatalf("rows = %q", got)
+	}
+	if hdr := m.containers.table.table.rows[2]; hdr[3] != "1/2 running" {
+		t.Fatalf("shop header = %q", hdr)
+	}
+	if !strings.Contains(m.containers.View(), "Containers(all)[4]") {
+		t.Fatal("the count must not include group headers")
+	}
+
+	// Sorting (reversed) stays within groups; headers keep leading.
+	m = send(t, m, press("S"))
+	want = []string{"▾ blog", "  blog-db-1", "▾ shop", "  shop-web-1", "  shop-api-1", "▾ (no project)", "  solo"}
+	if got := names(m.containers.table.table.rows); strings.Join(got, "|") != strings.Join(want, "|") {
+		t.Fatalf("reversed = %q", got)
+	}
+	m = send(t, m, press("S"))
+
+	// enter on the shop header folds it; the cursor stays on it. (Home
+	// goes to the top: "g" means "group" in this view.)
+	m = send(t, m, tea.KeyMsg{Type: tea.KeyHome})
+	m = send(t, m, press("j"))
+	m = send(t, m, press("j"))
+	m = send(t, m, press("enter"))
+	want = []string{"▾ blog", "  blog-db-1", "▸ shop", "▾ (no project)", "  solo"}
+	if got := names(m.containers.table.table.rows); strings.Join(got, "|") != strings.Join(want, "|") {
+		t.Fatalf("folded = %q", got)
+	}
+	if k, _ := m.containers.table.Selected(); k != "group:shop" || m.active != viewContainers {
+		t.Fatalf("selected %q, active %v", k, m.active)
+	}
+
+	// Filtering for a member of the folded group keeps its header.
+	m = send(t, m, press("/"))
+	m = typeKeys(t, m, "web")
+	m = send(t, m, press("enter"))
+	if got := names(m.containers.table.table.rows); strings.Join(got, "|") != "▸ shop" {
+		t.Fatalf("filtered = %q", got)
+	}
+	m = send(t, m, press("esc"))
+
+	// enter on a container (not a header) still opens its logs.
+	m = send(t, m, press("k"))
+	m = send(t, m, press("enter"))
+	if m.active != viewLogs || m.logs.container.Name != "blog-db-1" {
+		t.Fatalf("active=%v container=%q", m.active, m.logs.container.Name)
+	}
+}
+
+func TestGroupHeaderIgnoresContainerActions(t *testing.T) {
+	f := composeFake()
+	m := startModel(t, f)
+	m = send(t, m, press("g"))
+	m = send(t, m, tea.KeyMsg{Type: tea.KeyHome}) // the "blog" header
+	for _, k := range []string{"x", "D", "u", "i", "t"} {
+		m = send(t, m, press(k))
+	}
+	if m.confirm != nil || len(f.writes) != 0 || m.active != viewContainers {
+		t.Fatalf("actions on a header: confirm=%v writes=%v active=%v", m.confirm != nil, f.writes, m.active)
+	}
+}

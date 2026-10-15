@@ -2,6 +2,7 @@ package ui
 
 import (
 	"context"
+	"fmt"
 	"slices"
 	"strings"
 	"time"
@@ -26,8 +27,9 @@ type (
 )
 
 var containerKeyMap = struct {
-	Up, Down, Logs, All, Refresh key.Binding
+	Up, Down, Logs, All, Refresh, Group key.Binding
 }{
+	Group: key.NewBinding(key.WithKeys("g"), key.WithHelp("g", "group by compose project")),
 	// Refresh is the shared refreshKey (r).
 	Logs:    key.NewBinding(key.WithKeys("enter"), key.WithHelp("enter", "logs")),
 	Up:      key.NewBinding(key.WithKeys("up", "k"), key.WithHelp("↑/k", "up")),
@@ -43,12 +45,16 @@ type containersView struct {
 	items   map[string]docker.Container // by ID
 	showAll bool                        // like `docker ps -a`
 	loaded  bool
+	// grouped shows containers under their Docker Compose project, with
+	// a header row per project; collapsed projects show only the header.
+	grouped   bool
+	collapsed map[string]bool
 	gen     int // bumped on every load; late results of older loads are dropped
 	now     func() time.Time
 }
 
 func newContainersView(c docker.Client) containersView {
-	return containersView{table: newFilterTable(), client: c, showAll: true, now: time.Now}
+	return containersView{table: newFilterTable(), client: c, showAll: true, now: time.Now, collapsed: map[string]bool{}}
 }
 
 // load lists the containers off the UI goroutine.
@@ -81,7 +87,7 @@ func (v containersView) Update(msg tea.Msg) (containersView, tea.Cmd) {
 			v.items[c.ID] = c
 		}
 		v.loaded = true
-		v.table.SetRows(v.rows(msg.items)) // keeps the selection by ID
+		v.refresh() // keeps the selection by ID
 		return v, nil
 
 	case ageTickMsg:
@@ -96,6 +102,17 @@ func (v containersView) Update(msg tea.Msg) (containersView, tea.Cmd) {
 				return v, v.load()
 			case key.Matches(msg, containerKeyMap.Refresh):
 				return v, v.load()
+			case key.Matches(msg, containerKeyMap.Group):
+				v.grouped = !v.grouped
+				v.refresh()
+				return v, nil
+			case key.Matches(msg, containerKeyMap.Logs) && v.onHeader():
+				// enter on a project header folds or unfolds it.
+				k, _ := v.table.Selected()
+				project := strings.TrimPrefix(k, groupKeyPrefix)
+				v.collapsed[project] = !v.collapsed[project]
+				v.refresh()
+				return v, nil
 			case key.Matches(msg, containerKeyMap.Logs):
 				if c, ok := v.selected(); ok {
 					return v, func() tea.Msg { return openLogsMsg{container: c} }
@@ -135,6 +152,17 @@ func (v containersView) selected() (docker.Container, bool) {
 	return c, ok
 }
 
+// groupKeyPrefix marks the keys of project header rows.
+const groupKeyPrefix = "group:"
+
+// noProject groups containers not started by Docker Compose.
+const noProject = "(no project)"
+
+func (v containersView) onHeader() bool {
+	k, ok := v.table.Selected()
+	return ok && strings.HasPrefix(k, groupKeyPrefix)
+}
+
 // refresh re-renders the rows (e.g. so AGE moves on).
 func (v *containersView) refresh() {
 	items := make([]docker.Container, 0, len(v.items))
@@ -142,7 +170,74 @@ func (v *containersView) refresh() {
 		items = append(items, c)
 	}
 	slices.SortFunc(items, func(a, b docker.Container) int { return strings.Compare(a.Name, b.Name) })
-	v.table.SetRows(v.rows(items))
+	if v.grouped {
+		v.table.SetRows(v.groupedRows(items))
+	} else {
+		v.table.SetRows(v.rows(items))
+	}
+}
+
+// groupedRows puts containers under one header per compose project, the
+// projects in alphabetical order and "(no project)" last.
+func (v containersView) groupedRows(items []docker.Container) []tableRow {
+	byProject := map[string][]docker.Container{}
+	var projects []string
+	for _, c := range items {
+		p := c.Project
+		if p == "" {
+			p = noProject
+		}
+		if _, ok := byProject[p]; !ok {
+			projects = append(projects, p)
+		}
+		byProject[p] = append(byProject[p], c)
+	}
+	slices.SortFunc(projects, func(a, b string) int {
+		switch {
+		case a == noProject:
+			return 1
+		case b == noProject:
+			return -1
+		}
+		return strings.Compare(a, b)
+	})
+
+	var rows []tableRow
+	for _, p := range projects {
+		members := byProject[p]
+		running, names := 0, []string{p}
+		for _, c := range members {
+			if c.State == "running" {
+				running++
+			}
+			names = append(names, c.Name, c.Image)
+		}
+		arrow := "▾"
+		if v.collapsed[p] {
+			arrow = "▸"
+		}
+		style := headerRowStyle
+		if running < len(members) && p != noProject {
+			style = style.Foreground(healthStyles[pending].GetForeground()) // a service is down
+		}
+		rows = append(rows, tableRow{
+			key:    groupKeyPrefix + p,
+			cells:  []string{arrow + " " + p, "", "", fmt.Sprintf("%d/%d running", running, len(members)), "", ""},
+			filter: strings.Join(names, " "), // a folded group still matches its members
+			style:  style,
+			group:  p,
+			header: true,
+		})
+		if v.collapsed[p] {
+			continue
+		}
+		for _, r := range v.rows(members) {
+			r.group = p
+			r.cells[0] = "  " + r.cells[0]
+			rows = append(rows, r)
+		}
+	}
+	return rows
 }
 
 // rows turns containers into table rows. AGE sorts by creation time and
@@ -186,6 +281,8 @@ func (v containersView) View() string {
 	note := ""
 	if !v.loaded {
 		note = "loading…"
+	} else if v.grouped {
+		note = "grouped by compose project"
 	}
 	return v.table.View("Containers("+scope+")", note)
 }
@@ -199,6 +296,6 @@ func (v containersView) keys(readOnly bool) []key.Binding {
 		a := actionKeys
 		b = append(b, a.Start, a.Stop, a.Restart, a.Remove)
 	}
-	b = append(b, k.All, k.Refresh)
+	b = append(b, k.All, k.Group, k.Refresh)
 	return append(b, v.table.Keys()...)
 }

@@ -63,6 +63,7 @@ header shows `● live` or `○ reconnecting`.
 | `D` | remove container / image / volume / network (asks first; a running container is killed) |
 | `t` | live stats (CPU, memory, network, block I/O) with sparklines |
 | `a` | toggle all / running containers |
+| `g` | group containers by Docker Compose project (`enter` on a project folds it) |
 | `r` | refresh |
 | `:` | command (`:containers`/`:ps`, `:images`/`:img`, `:volumes`/`:vol`, `:networks`/`:net`, `:q`) |
 | `?` | help |

@@ -19,6 +19,7 @@ zdocker là "anh em" của [kboba](https://github.com/ducnt114/kboba): cùng ki�
 **Phase 2**
 
 10. [Phase 2.1: Volumes và Networks](#10-phase-21-volumes-và-networks)
+11. [Phase 2.2: Nhóm theo Compose project](#11-phase-22-nhóm-theo-compose-project)
 
 ---
 
@@ -421,7 +422,7 @@ So với kboba, zdocker cho thấy cùng một kiến trúc Bubble Tea áp vào 
 | Phase | Tính năng | Học được gì | Trạng thái |
 |---|---|---|---|
 | 2.1 | Volumes, Networks | View generic `listView[T]`, message generic | ✅ [mục 10](#10-phase-21-volumes-và-networks) |
-| 2.2 | Nhóm theo Docker Compose project | Nhóm/gập dòng trong bảng, label `com.docker.compose.*` | ⏳ |
+| 2.2 | Nhóm theo Docker Compose project | Nhóm/gập dòng trong bảng, label `com.docker.compose.*` | ✅ [mục 11](#11-phase-22-nhóm-theo-compose-project) |
 | 2.3 | Chọn docker context (`:ctx`) | Đọc `~/.docker/contexts`, tạo lại client như kboba đổi kube context | ⏳ |
 | 2.4 | `pull` image (có tiến trình) | Stream JSON tiến trình của từng layer, progress bar | ⏳ |
 | 2.5 | `prune` (containers đã dừng, images dangling) | Thao tác hàng loạt, xác nhận kèm con số sẽ bị xoá | ⏳ |
@@ -491,4 +492,56 @@ type listView[T any] struct { spec listSpec[T]; table filterTable; items map[str
 | Đếm network theo tên (có thể trùng/đổi) | Đếm theo `NetworkID` |
 | Hỏi xác nhận cho thao tác chắc chắn bị từ chối | `remove` trả lỗi trước khi hỏi (network dựng sẵn) |
 | Fixture test không sắp xếp như client thật | Fixture theo đúng thứ tự client trả về |
+
+## 11. Phase 2.2: Nhóm theo Compose project
+
+### Mục tiêu
+`g` trong bảng containers bật/tắt chế độ nhóm theo Docker Compose project:
+
+```
+▾ shop                     2/2 running
+    api        shop/api:dev   running   Up 2 hours
+    web        nginx:1.27     running   Up 2 hours (healthy)
+▾ (no project)             0/3 running
+    flaky      busybox:1.36   exited    Exited (137) 3 minutes ago
+```
+
+`enter` trên dòng tiêu đề gập/mở nhóm (`▾`/`▸`); dòng tiêu đề có màu vàng khi project có service không chạy. Filter và sort vẫn hoạt động: sort chỉ trong từng nhóm, filter giữ tiêu đề của nhóm có thành viên khớp — kể cả nhóm đang gập.
+
+### Học được gì
+- **Compose chỉ là label**: Docker Engine không biết "project"; Compose gắn `com.docker.compose.project` (và `…service`, `…container-number`) lên container, và mọi tool (kể cả `docker compose ps`) nhóm dựa vào label đó.
+- **Dòng không phải dữ liệu trong một bảng dữ liệu**: dòng tiêu đề nhóm phải đi cùng nhóm khi sort, không được tự lọc mất, không được đếm vào số dòng, và không nhận thao tác của container. Mỗi yêu cầu này là một điều kiện riêng trong code — dễ quên một cái (smoke test bắt được lỗi đếm).
+- **Sort ổn định nhiều tầng**: so sánh theo (thứ tự nhóm, tiêu đề trước, giá trị cột) bằng một comparator duy nhất.
+- **Xung đột phím giữa view và component**: `tableModel` dùng `g` để về đầu bảng; containers view dùng `g` cho nhóm và xử lý trước khi chuyển phím xuống table, nên `g` của table không còn tới được trong view này (`Home` vẫn dùng được).
+
+### Thể hiện trong code
+
+**`filterTable` biết về nhóm** (`internal/ui/filtertable.go`): `tableRow` có thêm `group string` và `header bool`. Trong `rebuild`:
+1. `liveGroups`: nhóm có ít nhất một thành viên (không phải tiêu đề) khớp filter.
+2. Giữ tiêu đề nếu bản thân nó khớp *hoặc* nhóm còn sống; giữ thành viên nếu khớp.
+3. Một `SortStableFunc` duy nhất: khác nhóm → theo thứ tự nhóm xuất hiện; cùng nhóm → tiêu đề trước; rồi mới đến cột sắp xếp. `S` khi chưa chọn cột → `reverseWithinGroups` (đảo thành viên, giữ tiêu đề và thứ tự nhóm).
+4. Số trên tiêu đề bảng chỉ đếm dòng không phải tiêu đề.
+
+Bảng không nhóm (images, volumes…) có mọi dòng cùng `group == ""` → hành vi không đổi.
+
+**Containers view** (`internal/ui/containers.go`):
+- `grouped`, `collapsed map[string]bool`.
+- `groupedRows`: gom theo `Project` (rỗng → `(no project)`), sắp tên project, `(no project)` cuối; với mỗi project một dòng tiêu đề (`key = "group:"+project`, `cells = ["▾ shop", …, "2/2 running", …]`, `filter` = tên project + tên và image các thành viên để nhóm gập vẫn tìm được) rồi các thành viên (thụt lề 2 dấu cách, cùng `group`) nếu không gập.
+- `enter`: trên tiêu đề (`onHeader`) → đảo `collapsed[project]`; trên container → logs như cũ.
+- Thao tác (`u x R D i t`) trên tiêu đề không làm gì: `selected()` tra key `group:…` trong `items` (map theo ID container) → không có → bỏ qua. Không cần thêm điều kiện nào.
+- Bật/tắt nhóm giữ nguyên container đang chọn (key ID không đổi).
+
+### Test liên quan
+- `internal/ui/root_test.go`: `TestGroupByComposeProject` (lựa chọn giữ nguyên sau `g`, thứ tự nhóm, `1/2 running`, số dòng không tính tiêu đề, `S` đảo trong nhóm, gập bằng enter và con trỏ ở lại tiêu đề, filter `web` giữ `▸ shop` đang gập, enter trên container mở logs), `TestGroupHeaderIgnoresContainerActions` (`x D u i t` trên tiêu đề không làm gì).
+- Thủ công với fake daemon: nhóm `shop` (2/2) và `(no project)` (0/3), gập/mở.
+
+### Bẫy
+| Bẫy | Cách xử lý |
+|---|---|
+| Sort đẩy tiêu đề nhóm đi chỗ khác | Comparator: nhóm → tiêu đề trước → cột |
+| Nhóm gập biến mất khi filter (không còn thành viên nào được đưa vào) | `filter` của tiêu đề chứa tên các thành viên |
+| Số dòng trên tiêu đề tính cả dòng nhóm (`[7]` thay vì `[5]`) | Chỉ đếm dòng không phải tiêu đề |
+| Thao tác container chạy trên dòng tiêu đề | Tiêu đề có key không nằm trong `items` → `selected()` false |
+| `g` của table (về đầu) bị che | Dùng `Home`; ghi chú trong help |
+| Test giả định con trỏ nhảy lên tiêu đề sau khi nhóm | Hành vi đúng là giữ container đang chọn; test điều hướng tường minh |
 
